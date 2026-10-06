@@ -83,6 +83,13 @@ def save_settings(data: dict):
 
 SETTINGS = load_settings()
 
+SENTINEL_ROUTES = {"original", "codex_luna"}
+
+
+def normalize_sentinel_route(value) -> str:
+    route = str(value or "original").strip().lower()
+    return route if route in SENTINEL_ROUTES else "original"
+
 def get_key(provider: str) -> str:
     if provider == "gemini":
         return SETTINGS.get("gemini_key", "")
@@ -90,31 +97,51 @@ def get_key(provider: str) -> str:
         return SETTINGS.get("gemini_free_key", "") or SETTINGS.get("gemini_key", "")
     if provider == "aipro":
         return SETTINGS.get("aipro_key", "")
+    if provider == "minimax":
+        return SETTINGS.get("minimax_tts_key", "")
     return SETTINGS.get("siliconflow_key", "")
 
 def get_sentinel_config() -> dict:
     """
-    返回哨兵/前置模型的配置。
-    若用户配置了自定义 URL，走 OpenAI 兼容格式；否则走 Gemini 原生 API。
-    返回: {"base_url": str, "api_key": str, "model": str, "use_openai": bool}
+    返回哨兵模型配置。Luna 使用本机 Codex 登录态；原线路保持兼容。
     """
+    route = normalize_sentinel_route(SETTINGS.get("sentinel_route"))
+    if route == "codex_luna":
+        return {
+            "route": "codex_luna",
+            "provider": "codex",
+            "base_url": "",
+            "api_key": "",
+            "model": "gpt-5.6-luna",
+            "reasoning_effort": "none",
+            "use_openai": False,
+            "ready": True,
+        }
+
     base_url = SETTINGS.get("sentinel_base_url", "").strip()
     api_key = SETTINGS.get("sentinel_api_key", "").strip()
     model = SETTINGS.get("sentinel_model", "").strip()
     if base_url and api_key:
         # 自定义中转站 / 硅基流动等 OpenAI 兼容
         return {
+            "route": "original",
+            "provider": "openai_compatible",
             "base_url": base_url.rstrip("/"),
             "api_key": api_key,
             "model": model or "Qwen/Qwen3.6-35B-A3B",
             "use_openai": True,
+            "ready": True,
         }
     # 默认走 Gemini 原生
+    gemini_key = get_key("gemini_free")
     return {
+        "route": "original",
+        "provider": "gemini",
         "base_url": "",
-        "api_key": get_key("gemini_free"),
+        "api_key": gemini_key,
         "model": model or "gemini-3.1-flash-lite",
         "use_openai": False,
+        "ready": bool(gemini_key),
     }
 
 def get_embedding_config() -> dict:
@@ -223,6 +250,7 @@ MODEL_TRANSPORT_MODES = {"legacy", "safe_live"}
 SAFE_LIVE_MODEL_DEFAULTS = {
     "Codex-Astra": "safe_live",
     "Codex-Sol": "safe_live",
+    "Codex-6-Sol": "safe_live",
     "3.8Vertex": "safe_live",
     "官Gem3.8flash": "safe_live",
 }
@@ -231,16 +259,14 @@ DEPRECATED_MODEL_KEYS = {"CLI-3.1pro", "AGY-3.1pro"}
 
 BUILTIN_MODELS = {
     "硅基GLM-5.2":      {"provider": "siliconflow", "model": "zai-org/GLM-5.2", "vision": False},
-    #  "硅基Kimi2.7":      {"provider": "siliconflow", "model": "moonshotai/Kimi-K2.7-Code", "vision": True},
-    #  "硅基DS-v4":      {"provider": "siliconflow", "model": "deepseek-ai/DeepSeek-V4-Pro", "vision": False},
+    "硅基DSv4pro":      {"provider": "siliconflow", "model": "deepseek-ai/DeepSeek-V4-Pro", "vision": False},
     "官Gem3.8flash":  {"provider": "gemini", "model": "gemini-3.8-flash", "vision": True},
-    "官Gem3.1pro":  {"provider": "gemini", "model": "gemini-3.1-pro-preview", "vision": True},
+    # "官Gem3.1pro":  {"provider": "gemini", "model": "gemini-3.1-pro-preview", "vision": True},
     # "Codex-5.5":            {"provider": "codex_cli",  "model": "gpt-5.5", "vision": True},
-    "Codex-Astra":    {"provider": "codex_cli",  "model": "gpt-6-astra", "vision": True, "transport_mode": "safe_live"},
+    # "Codex-Astra":    {"provider": "codex_cli",  "model": "gpt-6-astra", "vision": True, "transport_mode": "safe_live"},
     "Codex-Sol":      {"provider": "codex_cli",  "model": "gpt-5.6-sol", "vision": True, "transport_mode": "safe_live"},
-    # "Codex":          {"provider": "codex_cli",  "model": "gpt-5.6-terra", "vision": True},
+    "Codex-6-Sol":    {"provider": "codex_cli",  "model": "gpt-6-sol", "vision": True, "transport_mode": "safe_live"},
     # "Codex-Luna":     {"provider": "codex_cli",  "model": "gpt-5.6-luna", "vision": True},
-    # "CLI-3.1pro":       {"provider": "gemini_cli", "model": "gemini-3.1-pro-preview", "vision": True},
     
 }
 

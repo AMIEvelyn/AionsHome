@@ -1116,8 +1116,9 @@ async def build_aion_group_context(
         add_acknowledgement=True,
     )
 
-    # 3. 构建 recent_messages 用于 instant_digest
-    merged = await fetch_merged_timeline("aion", context_limit, room_id=room_id)
+    # 3. 构建 recent_messages 用于本地前置路由
+    # 群聊窗口共享历史，合并所有群聊与该角色私聊后按配置取最新条数。
+    merged = await fetch_merged_timeline("aion", context_limit)
 
     recent_for_digest = []
     for msg in merged[-6:]:
@@ -1209,8 +1210,9 @@ async def build_connor_group_context(
         add_acknowledgement=True,
     )
 
-    # 2. 构建 recent_messages 用于 instant_digest
-    merged = await fetch_merged_timeline("connor", context_limit, room_id=room_id)
+    # 2. 构建 recent_messages 用于本地前置路由
+    # 群聊窗口共享历史，合并所有群聊与该角色私聊后按配置取最新条数。
+    merged = await fetch_merged_timeline("connor", context_limit)
 
     recent_for_digest = []
     for msg in merged[-6:]:
@@ -1258,7 +1260,7 @@ async def build_connor_group_context(
     history.append({"role": "assistant", "content": "明白了。"})
 
     # 5. 统一时间线（合并 Connor 1v1 + 群聊消息）
-    merged = await fetch_merged_timeline("connor", context_limit, room_id=room_id)
+    merged = await fetch_merged_timeline("connor", context_limit)
     timeline_history = render_merged_timeline(
         merged,
         "connor",
@@ -1280,7 +1282,7 @@ async def build_connor_1v1_context(
     digest_result: dict = None,
     whisper_mode: bool = False,
 ) -> tuple[list[dict], dict]:
-    """为 Connor 1v1 聊天构建 messages 列表（含前置哨兵、背景浮现、原文追溯、附件图片）。
+    """为 Connor 1v1 聊天构建 messages 列表（含本地路由、背景浮现、原文追溯、附件图片）。
     返回 (messages, digest_result)。"""
     messages = []
     context_limit = max(1, int(context_limit or 30))
@@ -1311,7 +1313,7 @@ async def build_connor_1v1_context(
         add_acknowledgement=True,
     )
 
-    # 构建 recent_messages 用于 instant_digest（前置哨兵）
+    # 构建 recent_messages 用于本地前置路由
     recent_for_digest = []
     for msg in merged[-6:]:
         sender = msg.get("sender", "user")
@@ -1319,7 +1321,7 @@ async def build_connor_1v1_context(
         recent_for_digest.append({"role": role, "content": msg.get("content", "")[:200]})
     actual_recent = [m for m in recent_for_digest if m["role"] in ("user", "assistant")][-3:]
 
-    # 记忆召回（走统一 build_memory_blocks，含前置哨兵 + 背景浮现 + 原文追溯）
+    # 记忆召回（走统一 build_memory_blocks，含本地路由 + 背景浮现 + 原文追溯）
     async def _chatroom_recall(query, keywords):
         return await recall_chatroom_memories(query, room_id, "connor", keywords, top_k=5, min_results=3)
 

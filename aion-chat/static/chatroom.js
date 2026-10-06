@@ -11,6 +11,13 @@ let chatroomConnorModel = 'Codex';
 let chatroomReplyOrder = 'random';
 let isReplyOnce = false;
 let chatroomModels = [];
+let crStartupModelsReady = false;
+
+function crRequireModels() {
+  if (crStartupModelsReady) return true;
+  toast('正在加载模型设置，请稍后发送');
+  return false;
+}
 let pendingAttachments = [];  // [{url, type, name}]
 let crMessagesById = {};
 let memSourceMemId = null;
@@ -137,6 +144,18 @@ let crConnorName = '第二AI';
 function crName(sender) {
   return { user: crUserName || '我', aion: crAiName || 'AI', connor: crConnorName || '第二AI' }[sender] || sender;
 }
+
+window.AionPat?.bind({
+  container: document.getElementById('messages'),
+  getContext: () => ({
+    scope: 'chatroom', source_id: currentRoom?.id,
+    names: { user: crName('user'), aion: crName('aion'), connor: crName('connor') },
+  }),
+  onSent: message => {
+    if (message.room_id !== currentRoom?.id) return;
+    if (!messagesEl.querySelector(`[data-msg-id="${message.id}"]`)) appendMessage(message);
+  },
+});
 
 function applyChatroomNames(cfg = {}) {
   crAiName = cfg.ai_name || crAiName || 'AI';
@@ -430,6 +449,7 @@ function crCurrentTTSVoice() {
 }
 
 function crSendTTSState() {
+  window.AionTtsAudio?.setAutoPlaybackState?.(crTtsEnabled, crCurrentTTSVoice(), crTtsPlaybackActiveAt);
   if (!crWs || crWs.readyState !== WebSocket.OPEN) return;
   crWs.send(JSON.stringify({
     type: 'tts_state',
@@ -460,6 +480,7 @@ function crSuppressTTSMsg(msgId) {
 
 function crShouldAcceptTTSMsg(msgId, createdAt, targetClientId) {
   if (!msgId || crSuppressedTTSMsgIds.has(msgId)) return false;
+  if ((crMessagesById[msgId]?.attachments || []).some(att => att.type === 'chatroom_reply_failure')) return false;
   if (targetClientId && targetClientId !== crAmbientClientId) return false;
   const ts = Number(createdAt || 0);
   if (ts && ts < crTtsAcceptAfter) {
@@ -523,7 +544,7 @@ function crShowToyCapsule(msgId, commands) {
   scrollToBottom();
 }
 
-function crHandleToyCommand(data) {
+async function crHandleToyCommand(data) {
   if (!data || !data.commands || !data.commands.length) return;
   const msgId = data.msg_id || '';
   const commands = data.commands.map(c => String(c || '').trim().toUpperCase()).filter(Boolean);
@@ -654,8 +675,8 @@ function crEnqueueTTSChunk(msgId, seq, url, createdAt, targetClientId, text = ""
   if (!crTtsEnabled && !voiceCallActive) return;
   const key = `${msgId}:${seq}`;
   if (crSeenTTSChunks.has(key)) return;
-  crSeenTTSChunks.add(key);
   if (!crShouldAcceptTTSMsg(msgId, createdAt, targetClientId)) return;
+  crSeenTTSChunks.add(key);
   _ttsEngine.enqueue(msgId, seq, url, text);
 }
 
@@ -690,6 +711,7 @@ window.ChatroomVoiceCallAdapter = {
     crStopTTS();
   },
   async sendText(text) {
+    if (!crRequireModels()) return;
     const content = String(text || "").trim();
     if (!content) return;
     if (!currentRoom) throw new Error("请先选择聊天室");
@@ -700,13 +722,14 @@ window.ChatroomVoiceCallAdapter = {
     }
     if (isSending || isAiChatting || isReplyOnce) throw new Error("上一轮回复仍在进行");
 
+    const generation = _crControl.begin(currentRoom.id);
     isSending = true;
-    sendBtn.disabled = true;
+    crShowGenerationStop();
     playSend();
     const localRow = appendMessage({ sender: "user", content, created_at: Date.now() / 1000, attachments: [] });
     if (localRow) localRow.dataset.localEcho = "1";
     try {
-      const resp = await fetch(`${API}/rooms/${currentRoom.id}/send`, {
+      const resp = await _crControl.fetch(generation, `${API}/rooms/${currentRoom.id}/send`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -722,15 +745,19 @@ window.ChatroomVoiceCallAdapter = {
       });
       await consumeChatroomSSE(resp);
     } finally {
-      isSending = false;
-      sendBtn.disabled = false;
-      endStreamingBubble();
-      crRefocusComposerAfterSend();
+      if (_crControl.isCurrent(generation)) {
+        isSending = false;
+        crShowGenerationSend();
+        endStreamingBubble();
+        crRefocusComposerAfterSend();
+        _crControl.finish(generation);
+      }
     }
   }
 };
 
 function crStopTTS() {
+  window.AionTtsAudio?.stopAutoPlayback?.();
   _ttsEngine.stop();
 }
 
@@ -927,6 +954,7 @@ function isNearBottom() {
 }
 
 function scrollToBottom(force = false) {
+  if (messagesEl.querySelector('.ai-text-editing')) return;
   if (force || isNearBottom()) {
     messagesEl.scrollTop = messagesEl.scrollHeight;
   }
@@ -2050,6 +2078,7 @@ function crClearSystemLog() {
 }
 
 async function fetchCurrentModel(configPromise) {
+  const initial = { aion: chatroomModel, connor: chatroomConnorModel, order: chatroomReplyOrder };
   try {
     const [convs, models, cfg] = await Promise.all([
       fetch('/api/conversations').then(resp => resp.json()),
@@ -2057,9 +2086,9 @@ async function fetchCurrentModel(configPromise) {
       configPromise || api('/config'),
     ]);
     if (Array.isArray(models)) chatroomModels = models;
-    if (cfg?.connor_model) chatroomConnorModel = cfg.connor_model;
-    if (cfg?.reply_order) chatroomReplyOrder = cfg.reply_order;
-    if (Array.isArray(convs) && convs.length > 0 && convs[0].model) {
+    if (cfg?.connor_model && chatroomConnorModel === initial.connor) chatroomConnorModel = cfg.connor_model;
+    if (cfg?.reply_order && chatroomReplyOrder === initial.order) chatroomReplyOrder = cfg.reply_order;
+    if (chatroomModel === initial.aion && Array.isArray(convs) && convs.length > 0 && convs[0].model) {
       chatroomModel = convs[0].model;
     }
     updateHeaderActions();
@@ -2375,6 +2404,9 @@ function crMessagesForDisplay(msgs) {
   let pendingLegacyNotices = [];
   const list = msgs || [];
   const indexById = new Map(list.map((m, idx) => [m?.id, idx]));
+  const inlinePats = window.AionPat?.collectInlineNotices(list) || {
+    bySourceId: new Map(), noticeIds: new Set(),
+  };
 
   function appendPendingFor(id) {
     const pending = pendingById.get(id);
@@ -2390,6 +2422,7 @@ function crMessagesForDisplay(msgs) {
 
   for (let idx = 0; idx < list.length; idx++) {
     const m = list[idx];
+    if (m?.id && inlinePats.noticeIds.has(String(m.id))) continue;
     const afterMsgId = crSystemNoticeAfterMsgId(m);
     if (afterMsgId && indexById.has(afterMsgId) && idx < indexById.get(afterMsgId)) {
       if (!pendingById.has(afterMsgId)) pendingById.set(afterMsgId, []);
@@ -2406,7 +2439,8 @@ function crMessagesForDisplay(msgs) {
       out.push(...pendingLegacyNotices);
       pendingLegacyNotices = [];
     }
-    out.push(m);
+    const notices = m?.id ? inlinePats.bySourceId.get(String(m.id)) : null;
+    out.push(notices?.length ? {...m, _inlinePatNotices: notices} : m);
     if (crIsAiSender(m?.sender)) appendPendingFor(m.id);
   }
   if (pendingLegacyNotices.length) out.push(...pendingLegacyNotices);
@@ -2568,6 +2602,8 @@ async function crCenterSearchResult(msgId) {
 if (chatSearchForm) chatSearchForm.addEventListener('submit', runChatSearch);
 
 function renderMessages(msgs) {
+  const restoreEditors = window.AIMessageEditor?.preserve(messagesEl);
+  const previousScrollTop = messagesEl.scrollTop;
   crRenderedRoomId = currentRoom?.id || null;
   crMessageRevision++;
   crMessagesById = {};
@@ -2582,11 +2618,14 @@ function renderMessages(msgs) {
   msgs.forEach(m => { if (m.id) crMessagesById[m.id] = m; });
   const displayMessages = crMessagesForDisplay(msgs);
   messagesEl.innerHTML = displayMessages.map((m, index) => msgHTML(m, displayMessages[index + 1])).join('');
+  if (restoreEditors?.()) messagesEl.scrollTop = previousScrollTop;
   crApplySongGenIndicator();
 }
 
 function crMsgMenuHtml(sender, msgId, opts = {}) {
   if (!msgId) return '';
+  const editHtml = sender === 'aion' || sender === 'connor'
+    ? `<button onclick="editChatroomAiMsg('${msgId}');closeMsgMenus()">编辑</button>` : '';
   const actionHtml = opts.deleteOnly || sender === 'system'
     ? ''
     : sender === 'user'
@@ -2596,6 +2635,7 @@ function crMsgMenuHtml(sender, msgId, opts = {}) {
     <div class="msg-menu-wrap">
       <button class="msg-menu-btn" onclick="toggleMsgMenu(event)">\u22ef</button>
       <div class="msg-menu-dropdown">
+        ${editHtml}
         ${actionHtml}
         <button class="danger" onclick="deleteMsg('${msgId}', this)">\u5220\u9664</button>
       </div>
@@ -2626,7 +2666,8 @@ function crMsgSenderLineHtml(sender, name, msgId, msg = null, opts = {}) {
   const timeHtml = msg?.created_at
     ? `<span class="message-time">${esc(timeStr(msg.created_at))}</span>`
     : '';
-  const ttsHtml = opts.tts && sender !== 'user' && msgId
+  const replyFailed = (msg?.attachments || []).some(att => att.type === 'chatroom_reply_failure');
+  const ttsHtml = opts.tts && sender !== 'user' && msgId && !replyFailed
     ? `<button class="tts-replay-btn" onclick="crReplayTTS('${msgId}', this)" title="重听语音">🔊</button>`
     : '';
   const memoryHtml = opts.memory && msgId
@@ -2700,6 +2741,18 @@ function crMessageContentItems(raw, isUser = false) {
   return items;
 }
 
+function crMessageContentItemsWithInlinePats(raw, isUser, notices) {
+  if (isUser || !notices?.length || !window.AionPat?.interleaveContent) {
+    return crMessageContentItems(raw, isUser);
+  }
+  const items = [];
+  for (const part of window.AionPat.interleaveContent(raw, notices)) {
+    if (part.type === 'notice') items.push({type: 'pat_notice', message: part.message});
+    else items.push(...crMessageContentItems(part.text, isUser));
+  }
+  return items;
+}
+
 let crProactiveCompanionshipStatus = { aion: false, connor: false };
 
 function crRenderProactiveOrbit() {
@@ -2743,7 +2796,7 @@ function crBubbleUnitHtml({ sender, name, avatar, msgId, msg, html, showHeader, 
 }
 
 function crMessageUnitHtml({ sender, name, avatar, senderLine, contentHtml, extraClass = '' }) {
-  const avatarHtml = `<div class="msg-avatar-col"><img class="avatar" src="${avatar}" alt="${esc(name)}"></div>`;
+  const avatarHtml = `<div class="msg-avatar-col"><img class="avatar" src="${avatar}" alt="${esc(name)}" data-pat-target="${sender}" role="button" tabindex="0" title="双击拍拍" aria-label="双击拍拍" draggable="false"></div>`;
   if (sender === 'user') {
     return `<div class="message-unit ${sender} user-message-unit${extraClass}">
       <div class="message-header user-message-header">
@@ -2801,9 +2854,11 @@ function crRenderMessageItems(items, { sender, name, avatar, msgId, msg, fmt, is
     tts: !isUser,
     memory: !isUser && crMemoryRecordMsgIds.has(msgId),
   });
-  const contentHtml = items.map(item => item.type === 'monologue'
-    ? `<div class="inner-monologue-line">${esc(item.text)}</div>`
-    : `<div class="${isUser ? 'bubble' : 'ai-message-content'} markdown-body">${crMarkdownMessageHtml(item.text, isUser)}</div>`
+  const contentHtml = items.map(item => item.type === 'pat_notice'
+    ? msgHTML(item.message)
+    : item.type === 'monologue'
+      ? `<div class="inner-monologue-line">${esc(item.text)}</div>`
+      : `<div class="${isUser ? 'bubble' : 'ai-message-content'} markdown-body">${crMarkdownMessageHtml(item.text, isUser)}</div>`
   ).join('');
   return crMessageUnitHtml({
     sender,
@@ -2829,15 +2884,21 @@ function crBandVibrationNoteHtml(atts) {
 
 function msgHTML(m, nextMessage = null) {
   const sender = m.sender || 'user';
+  const pat = window.AionPat?.isPat(m);
   const loungeStatus = window.LoungeVisitUI && window.LoungeVisitUI.isStatusMessage(m);
 
   // 系统事件消息（点歌、闹钟等）
   if (sender === 'system') {
     const msgId = m.id || '';
+    if ((m.attachments || []).some(att => att.type === 'chatroom_reply_failure')) {
+      return `<div class="system-event-msg" data-msg-id="${esc(msgId)}" tabindex="0" onclick="this.focus()"><div class="system-notice-text" style="white-space:pre-wrap;user-select:text;-webkit-user-select:text">${esc(m.content || '')}</div>${crMsgMenuHtml('system', msgId)}</div>`;
+    }
     const afterMsgId = crSystemNoticeAfterMsgId(m);
     const beforeMsgId = crSystemNoticeBeforeMsgId(m, nextMessage);
     const afterAttr = afterMsgId ? ` data-after-msg-id="${esc(afterMsgId)}"` : '';
     const beforeAttr = beforeMsgId ? ` data-before-msg-id="${esc(beforeMsgId)}"` : '';
+    const repairHtml = window.RepairResultCard?.render(m.attachments, m.content);
+    if (repairHtml) return `<div class="system-event-msg repair-result-message" data-msg-id="${msgId}" tabindex="0" onclick="this.focus()"${afterAttr}${beforeAttr}>${repairHtml}${crMsgMenuHtml('system', msgId)}</div>`;
     const snapshotHtml = window.MonitorCameraSnapshot
       ? window.MonitorCameraSnapshot.renderMonitorCameraSnapshot(
           m.attachments,
@@ -2849,10 +2910,10 @@ function msgHTML(m, nextMessage = null) {
           },
         )
       : '';
-    const contentHtml = snapshotHtml || (window.SystemNoticeUI
-      ? window.SystemNoticeUI.renderSystemNoticeContent(m.content, {escapeHtml: esc})
+    const contentHtml = pat ? `<span class="pat-text">${esc(m.content || '')}</span>` : snapshotHtml || (window.SystemNoticeUI
+      ? window.SystemNoticeUI.renderSystemNoticeContent(m.content, {escapeHtml: esc, attachments: m.attachments})
       : `<span class="system-event-text">${esc(m.content || '')}</span>`);
-    return `<div class="system-event-msg${loungeStatus ? ' lounge-visit-status-line' : ''}" data-msg-id="${msgId}" tabindex="0" onclick="this.focus()"${afterAttr}${beforeAttr}>
+    return `<div class="system-event-msg${pat ? ' pat-notice' : ''}${loungeStatus ? ' lounge-visit-status-line' : ''}" data-msg-id="${msgId}" tabindex="0" onclick="this.focus()"${afterAttr}${beforeAttr}>
       <div class="system-event-line">
         <span class="system-notice-marker" aria-hidden="true">&gt;</span>
         ${contentHtml}
@@ -2866,7 +2927,8 @@ function msgHTML(m, nextMessage = null) {
   const avatar = AVATARS[sender] || AVATARS.user;
   const isUser = sender === 'user';
   const originalRaw = m.content || '';
-  const raw = crStripWishFulfillmentMarker(originalRaw);
+  const inlineToy = !isUser && window.SystemNoticeUI?.splitInlineToyCommands?.(originalRaw);
+  const raw = crStripWishFulfillmentMarker(inlineToy ? inlineToy.content : originalRaw);
   const messageAttachments = crWithWishFallbackAttachments(m);
 
   // 判断是否为纯语音消息（只有语音附件，content 是转写文本或为空）
@@ -2902,7 +2964,7 @@ function msgHTML(m, nextMessage = null) {
       preBubbleHtml: attHtml,
     })}</div>`;
   } else if (!hasDateSummaryAtt && !hasLoungeReportAtt && (!hasWishFulfillmentAtt || !isUser)) {
-    const items = crMessageContentItems(raw, isUser);
+    const items = crMessageContentItemsWithInlinePats(raw, isUser, m._inlinePatNotices);
     bubblesHtml = items.length
       ? `<div class="message-stack">${crRenderMessageItems(items, { sender, name, avatar, msgId: m.id || '', msg: m, fmt, isUser })}</div>`
       : `<div class="message-stack">${crBubbleUnitHtml({
@@ -2924,6 +2986,7 @@ function msgHTML(m, nextMessage = null) {
           ${toyHtml}
           ${hasWishFulfillmentAtt || hasDateSummaryAtt || hasLoungeReportAtt || isVoiceOnly ? '' : attHtml}
           ${bandVibrationHtml}
+          ${inlineToy?.noticeHtml ? `<div class="system-notice">${inlineToy.noticeHtml}</div>` : ''}
         </div>
       </div>
     </div>`;
@@ -3070,26 +3133,146 @@ function removeRowsAfter(row, includeSelf = false) {
   }
 }
 
+function crShowGenerationStop() {
+  sendBtn.disabled = false;
+  sendBtn.textContent = '■';
+  sendBtn.classList.add('stop-mode');
+  sendBtn.title = '停止本次回复';
+  sendBtn.setAttribute('aria-label', '停止本次回复');
+}
+
+function crShowGenerationSend() {
+  if (_crControl.active || _crControl.retryStop) { crShowGenerationStop(); return; }
+  sendBtn.disabled = false;
+  sendBtn.textContent = '➤';
+  sendBtn.classList.remove('stop-mode');
+  sendBtn.title = '发送';
+  sendBtn.setAttribute('aria-label', '发送');
+}
+
+const _crControl = new ChatGenerationControl({
+  surface: 'chatroom',
+  baseUrl: id => `${API}/rooms/${encodeURIComponent(id)}`,
+  onStart: crShowGenerationStop,
+  onStop(generation) {
+    generation.messageIds.forEach(crSuppressTTSMsg);
+    crStopTTS();
+    isSending = false;
+    isAiChatting = false;
+    isReplyOnce = false;
+    endStreamingBubble();
+    pendingStreamSender = null;
+    pendingStreamId = null;
+    messagesEl.querySelectorAll('.typing-indicator').forEach(el => el.remove());
+    removeAiChatStatus();
+    crDismissSongGenIndicator();
+    if (aiChatBtn) { aiChatBtn.disabled = false; aiChatBtn.textContent = '💬 让他们聊'; }
+    if (replyAionBtn) replyAionBtn.disabled = false;
+    if (replyConnorBtn) replyConnorBtn.disabled = false;
+    updateHeaderActions();
+    crShowGenerationStop();
+  },
+  onFinish: crShowGenerationSend,
+  onReconcile(generation, result) {
+    const ids = result.message_ids || [];
+    ids.forEach(crSuppressTTSMsg);
+    if (_ttsEngine.playOrder.some(id => ids.includes(id))) crStopTTS();
+    if (currentRoom?.id !== generation.target) return;
+    for (const msg of result.messages || []) {
+      crMessagesById[msg.id] = msg;
+      const row = document.getElementById(`streaming-${msg.id}`) || messagesEl.querySelector(`[data-msg-id="${msg.id}"]`);
+      if (row) {
+        const div = document.createElement('div');
+        div.innerHTML = msgHTML(msg);
+        row.replaceWith(div.firstElementChild);
+      } else appendMessage(msg);
+    }
+  },
+  onError(message) { if (!_crControl.active) crShowGenerationStop(); toast(message); },
+});
+
+// Capture the button before the composer submit handler; it also covers followups.
+sendBtn.addEventListener('click', event => {
+  if (_crControl.active || _crControl.retryStop) {
+    event.preventDefault();
+    event.stopImmediatePropagation();
+    _crControl.stop();
+  }
+}, true);
+
 async function consumeChatroomSSE(resp) {
+  const generation = resp.chatGeneration;
   const reader = resp.body.getReader();
   const decoder = new TextDecoder();
   let buffer = '';
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
+  try { while (true) {
+    let timer;
+    let result;
+    try {
+      result = await Promise.race([
+        reader.read(),
+        new Promise((_, reject) => {
+          timer = setTimeout(() => reject(new Error('连接等待超时（超过 330 秒未收到进展）')), 330000);
+        }),
+      ]);
+    } finally { clearTimeout(timer); }
+    const { done, value } = result;
+    if (done) {
+      if (pendingStreamSender || streamingBubble) {
+        crHandleReplyFailure({ content: '回复连接已结束，但未收到完整回复。已保留收到的内容，可编辑上一条消息重试。' });
+      }
+      break;
+    }
     buffer += decoder.decode(value, { stream: true });
     const lines = buffer.split('\n');
     buffer = lines.pop();
     for (const line of lines) {
       if (!line.startsWith('data: ')) continue;
-      try { handleSSE(JSON.parse(line.slice(6))); } catch {}
+      let data;
+      try { data = JSON.parse(line.slice(6)); } catch { continue; }
+      if (_crControl.accepts(data, generation)) handleSSE(data);
     }
+  } } catch (error) {
+    if (!generation?.stopped && error.name !== 'AbortError') {
+      crHandleReplyFailure({ content: `本次回复接收失败：${error.message || error}` });
+      // Stop waiting on the broken connection. Editing/resending explicitly
+      // stops the owned backend request before starting a new one.
+      reader.cancel().catch(() => {});
+    }
+    throw error;
   }
+}
+
+function crCanEditMessage() {
+  return !(isSending || isAiChatting) || !!_crControl.active?.replyFailed;
+}
+
+function editChatroomAiMsg(msgId) {
+  closeMsgMenus();
+  const msg = crMessagesById[msgId];
+  if (!msg || !crIsAiSender(msg.sender)) return;
+  if (isSending || isAiChatting) { toast('请等当前回复结束，或先停止回复后再编辑'); return; }
+  const roomId = currentRoom.id;
+  const row = messagesEl.querySelector(`[data-msg-id="${msgId}"]`);
+  window.AIMessageEditor.open(row, row?.querySelector('.msg-content'), msg.content,
+    async content => {
+      if (isSending || isAiChatting) throw new Error('请先等当前回复结束再保存');
+      const result = await api(`/messages/${encodeURIComponent(msgId)}`, {
+        method: 'PUT', body: JSON.stringify({ content }),
+      });
+      return result.message;
+    },
+    updated => {
+      if (currentRoom?.id !== roomId || !crMessagesById[msgId]) return;
+      if (updated) { crMessagesById[msgId] = updated; crMessageRevision++; }
+      const displayMsg = crMessagesForDisplay(Object.values(crMessagesById)).find(m => m.id === msgId) || crMessagesById[msgId];
+      if (row?.isConnected) row.outerHTML = msgHTML(displayMsg);
+    });
 }
 
 function editChatroomMsg(msgId) {
   const msg = crMessagesById[msgId];
-  if (!msg || msg.sender !== 'user' || isSending || isAiChatting) return;
+  if (!msg || msg.sender !== 'user' || !crCanEditMessage()) return;
   const row = document.querySelector(`[data-msg-id="${msgId}"]`);
   const bubble = row?.querySelector('.bubble');
   if (!bubble) return;
@@ -3116,14 +3299,26 @@ function cancelChatroomEdit() {
 }
 
 async function saveChatroomEdit(msgId) {
+  if (!crRequireModels()) return;
   const ta = document.getElementById(`edit_${msgId}`);
   const msg = crMessagesById[msgId];
-  if (!ta || !msg || isSending || isAiChatting) return;
+  if (!ta || ta.disabled || !msg || !crCanEditMessage()) return;
   const content = ta.value.trim();
   if (!content) { toast('内容不能为空'); return; }
+  ta.disabled = true;
 
+  if (_crControl.active || _crControl.retryStop) {
+    await _crControl.stop();
+    if (_crControl.active || _crControl.retryStop) {
+      ta.disabled = false;
+      toast('上一轮还在停止，请稍后再次确认重发');
+      return;
+    }
+  }
+
+  const generation = _crControl.begin(currentRoom.id);
   isSending = true;
-  sendBtn.disabled = true;
+  crShowGenerationStop();
   msg.content = content;
   const row = document.querySelector(`[data-msg-id="${msgId}"]`);
   removeRowsAfter(row, false);
@@ -3134,7 +3329,7 @@ async function saveChatroomEdit(msgId) {
   }
 
   try {
-    const resp = await fetch(`${API}/messages/${msgId}/edit-resend`, {
+    const resp = await _crControl.fetch(generation, `${API}/messages/${msgId}/edit-resend`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -3149,25 +3344,38 @@ async function saveChatroomEdit(msgId) {
     });
     await consumeChatroomSSE(resp);
   } catch (err) {
+    if (generation.stopped || err.name === 'AbortError') return;
     toast('编辑重发失败: ' + err.message);
     await loadMessages();
   } finally {
-    isSending = false;
-    sendBtn.disabled = false;
-    endStreamingBubble();
-    crRefocusComposerAfterSend();
+    if (_crControl.isCurrent(generation)) {
+      isSending = false;
+      crShowGenerationSend();
+      endStreamingBubble();
+      crRefocusComposerAfterSend();
+      _crControl.finish(generation);
+    }
   }
 }
 
 async function regenerateChatroomMsg(msgId) {
+  if (!crRequireModels()) return;
   const msg = crMessagesById[msgId];
-  if (!msg || msg.sender === 'user' || isSending || isAiChatting) return;
+  if (!msg || !crIsAiSender(msg.sender) || !crCanEditMessage()) return;
+  if (_crControl.active || _crControl.retryStop) {
+    await _crControl.stop();
+    if (_crControl.active || _crControl.retryStop) {
+      toast('上一轮还在停止，请稍后再次重新生成');
+      return;
+    }
+  }
+  const generation = _crControl.begin(currentRoom.id);
   isSending = true;
-  sendBtn.disabled = true;
+  crShowGenerationStop();
   const row = document.querySelector(`[data-msg-id="${msgId}"]`);
   removeRowsAfter(row, true);
   try {
-    const resp = await fetch(`${API}/messages/${msgId}/regenerate`, {
+    const resp = await _crControl.fetch(generation, `${API}/messages/${msgId}/regenerate`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -3181,12 +3389,16 @@ async function regenerateChatroomMsg(msgId) {
     });
     await consumeChatroomSSE(resp);
   } catch (err) {
+    if (generation.stopped || err.name === 'AbortError') return;
     toast('重新生成失败: ' + err.message);
     await loadMessages();
   } finally {
-    isSending = false;
-    sendBtn.disabled = false;
-    endStreamingBubble();
+    if (_crControl.isCurrent(generation)) {
+      isSending = false;
+      crShowGenerationSend();
+      endStreamingBubble();
+      _crControl.finish(generation);
+    }
   }
 }
 
@@ -3206,7 +3418,7 @@ function appendMessage(m) {
   if (empty) empty.remove();
   // 移除 typing 指示器
   const typing = messagesEl.querySelector('.typing-indicator');
-  if (typing) typing.remove();
+  if (typing && !window.AionPat?.isPat(m)) typing.remove();
 
   const div = document.createElement('div');
   div.innerHTML = msgHTML(m);
@@ -3400,6 +3612,14 @@ function endStreamingBubble(messageOrAttachments) {
       if (crIsAiSender(finalMsg.sender)) crMovePrecedingRelatedSystemNoticesAfter(renderedRow, finalMsg.id || '');
       if (crMemoryRecordMsgIds.has(finalMsg.id)) crApplyMemoryHint(finalMsg.id);
       crShowToyCapsule(finalMsg.id, crToyCommandsFromAttachments(finalMsg.attachments));
+      const inlinePats = window.AionPat?.collectInlineNotices(Object.values(crMessagesById));
+      if (inlinePats?.bySourceId.has(String(finalMsg.id))) {
+        const messages = Object.values(crMessagesById).sort(
+          (a, b) => Number(a.created_at || 0) - Number(b.created_at || 0),
+        );
+        renderMessages(messages);
+        scrollToBottom();
+      }
     }
     streamingBubble = null;
     streamingText = '';
@@ -3490,15 +3710,20 @@ function crShowMemoryRecordCard(msgId) {
 
 composer.addEventListener('submit', async (e) => {
   e.preventDefault();
+  if (_crControl.active) { _crControl.stop(); return; }
+  if (!crRequireModels()) return;
   const text = inputEl.value.trim();
+  if (pendingAttachments.some(a => a.uploading)) { toast('图片或附件还在上传，请稍等'); return; }
   if ((!text && !pendingAttachments.length) || !currentRoom || isSending) return;
 
+  const generation = _crControl.begin(currentRoom.id);
   isSending = true;
-  sendBtn.disabled = true;
+  crShowGenerationStop();
   inputEl.value = '';
   resizeInput();
 
   const attachments = pendingAttachments.map(a => a.url);
+  pendingAttachments.forEach(a => ChatImageUpload.release(a));
   pendingAttachments = [];
   renderPreview();
 
@@ -3508,7 +3733,7 @@ composer.addEventListener('submit', async (e) => {
   if (localRow) localRow.dataset.localEcho = '1';
 
   try {
-    const resp = await fetch(`${API}/rooms/${currentRoom.id}/send`, {
+    const resp = await _crControl.fetch(generation, `${API}/rooms/${currentRoom.id}/send`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ content: text, model: chatroomModel, connor_model: chatroomConnorModel, attachments, tts_enabled: crTtsEnabled, tts_aion_voice: crTtsAionVoice, tts_connor_voice: crTtsConnorVoice, whisper_mode: crWhisperMode }),
@@ -3516,14 +3741,43 @@ composer.addEventListener('submit', async (e) => {
 
     await consumeChatroomSSE(resp);
   } catch (err) {
+    if (generation.stopped || err.name === 'AbortError') return;
     toast('发送失败: ' + err.message);
   } finally {
-    isSending = false;
-    sendBtn.disabled = false;
-    endStreamingBubble();
-    crRefocusComposerAfterSend();
+    if (_crControl.isCurrent(generation)) {
+      isSending = false;
+      crShowGenerationSend();
+      endStreamingBubble();
+      crRefocusComposerAfterSend();
+      _crControl.finish(generation);
+    }
   }
 });
+
+function crHandleReplyFailure(data) {
+  if (_crControl.active) _crControl.active.replyFailed = true;
+  const row = streamingBubble?.closest('.message-row');
+  const streamId = pendingStreamId || row?.id?.replace('streaming-', '');
+  const failedId = data.message?.id || streamId;
+  crSuppressTTSMsg(failedId);
+  crSuppressTTSMsg(streamId);
+  if (_ttsEngine.playOrder.some(id => id === failedId || id === streamId)) crStopTTS();
+  pendingStreamSender = null;
+  pendingStreamId = null;
+  // A persisted failure contains the received prefix and reason, using the
+  // original stream id. Replace the provisional row with that saved content.
+  // If disconnected, keep the local prefix and append a visible local notice.
+  endStreamingBubble(data.message?.id === streamId ? data.message : undefined);
+  messagesEl.querySelectorAll('.typing-indicator').forEach(el => el.remove());
+  if (data.message) {
+    if (!messagesEl.querySelector(`[data-msg-id="${data.message.id}"]`)) appendMessage(data.message);
+  } else {
+    appendMessage({ sender: 'system', content: data.content || '回复失败：连接中断',
+      created_at: Date.now() / 1000, attachments: [{ type: 'chatroom_reply_failure' }] });
+  }
+  toast('本次回复未完成，原因已留在聊天中，可重新生成或删除');
+  crRefocusComposerAfterSend();
+}
 
 function handleSSE(data) {
   switch (data.type) {
@@ -3580,10 +3834,8 @@ function handleSSE(data) {
       break;
     case 'connor_failed':
     case 'aion_failed':
-      pendingStreamSender = null;
-      pendingStreamId = null;
-      messagesEl.querySelector('.typing-indicator')?.remove();
-      toast(data.content || '回复连接异常，可重试');
+    case 'error':
+      crHandleReplyFailure(data);
       break;
     case 'connor_done':
       pendingStreamSender = null;
@@ -3611,9 +3863,6 @@ function handleSSE(data) {
       break;
     case 'tts_done':
       crFinishTTSForMsg(data.data.msg_id, data.data.created_at, data.data.target_client_id);
-      break;
-    case 'error':
-      toast('错误: ' + data.content);
       break;
     case 'system_msg':
       if (data.message) {
@@ -3663,13 +3912,15 @@ inputEl.addEventListener('keydown', (e) => {
 // ══════════════════════════════════════════════════
 
 async function triggerAiChat() {
+  if (!crRequireModels()) return;
   if (!currentRoom || currentRoom.type !== 'group' || isSending || isAiChatting || isReplyOnce) return;
+  const generation = _crControl.begin(currentRoom.id);
   isAiChatting = true;
   aiChatBtn.disabled = true;
   aiChatBtn.textContent = '⏳ 互聊中...';
 
   try {
-    const resp = await fetch(`${API}/rooms/${currentRoom.id}/ai-chat`, {
+    const resp = await _crControl.fetch(generation, `${API}/rooms/${currentRoom.id}/ai-chat`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ model: chatroomModel, connor_model: chatroomConnorModel, tts_enabled: crTtsEnabled, tts_aion_voice: crTtsAionVoice, tts_connor_voice: crTtsConnorVoice }),
@@ -3677,20 +3928,26 @@ async function triggerAiChat() {
 
     await consumeChatroomSSE(resp);
   } catch (err) {
+    if (generation.stopped || err.name === 'AbortError') return;
     toast('AI 互聊失败: ' + err.message);
   } finally {
-    isAiChatting = false;
-    aiChatBtn.disabled = false;
-    aiChatBtn.textContent = '💬 让他们聊';
-    endStreamingBubble();
-    removeAiChatStatus();
+    if (_crControl.isCurrent(generation)) {
+      isAiChatting = false;
+      aiChatBtn.disabled = false;
+      aiChatBtn.textContent = '💬 让他们聊';
+      endStreamingBubble();
+      removeAiChatStatus();
+      _crControl.finish(generation);
+    }
   }
 }
 
 async function triggerReplyOnce(speaker) {
+  if (!crRequireModels()) return;
   if (!currentRoom || currentRoom.type !== 'group' || isSending || isAiChatting || isReplyOnce) return;
   if (!['aion', 'connor'].includes(speaker)) return;
 
+  const generation = _crControl.begin(currentRoom.id);
   isReplyOnce = true;
   isAiChatting = true;
   if (replyAionBtn) replyAionBtn.disabled = true;
@@ -3701,7 +3958,7 @@ async function triggerReplyOnce(speaker) {
   if (activeBtn) activeBtn.textContent = `${crName(speaker)} 回复中...`;
 
   try {
-    const resp = await fetch(`${API}/rooms/${currentRoom.id}/reply-once`, {
+    const resp = await _crControl.fetch(generation, `${API}/rooms/${currentRoom.id}/reply-once`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -3716,22 +3973,51 @@ async function triggerReplyOnce(speaker) {
     });
     await consumeChatroomSSE(resp);
   } catch (err) {
+    if (generation.stopped || err.name === 'AbortError') return;
     toast(`${crName(speaker)} 回复失败: ` + err.message);
   } finally {
-    isReplyOnce = false;
-    isAiChatting = false;
-    if (replyAionBtn) replyAionBtn.disabled = false;
-    if (replyConnorBtn) replyConnorBtn.disabled = false;
-    if (aiChatBtn) aiChatBtn.disabled = false;
-    if (activeBtn) activeBtn.textContent = oldText;
-    endStreamingBubble();
-    updateHeaderActions();
+    if (_crControl.isCurrent(generation)) {
+      isReplyOnce = false;
+      isAiChatting = false;
+      if (replyAionBtn) replyAionBtn.disabled = false;
+      if (replyConnorBtn) replyConnorBtn.disabled = false;
+      if (aiChatBtn) aiChatBtn.disabled = false;
+      if (activeBtn) activeBtn.textContent = oldText;
+      endStreamingBubble();
+      updateHeaderActions();
+      _crControl.finish(generation);
+    }
   }
 }
 
 // ══════════════════════════════════════════════════
 //  设置
 // ══════════════════════════════════════════════════
+
+async function renameCurrentRoom() {
+  if (!currentRoom) { toast('请先选择一个房间'); return; }
+  const roomId = currentRoom.id;
+  const title = prompt('修改房间名称：', currentRoom.title || '');
+  if (title === null || !title.trim() || title.trim() === currentRoom.title) return;
+  const nextTitle = title.trim();
+  roomTitleEl.disabled = true;
+  try {
+    await api(`/rooms/${roomId}`, { method: 'PUT', body: JSON.stringify({ title: nextTitle }) });
+    rooms = rooms.map(room => room.id === roomId ? { ...room, title: nextTitle } : room);
+    if (currentRoom?.id === roomId) {
+      currentRoom = { ...currentRoom, title: nextTitle };
+      roomTitleEl.textContent = nextTitle;
+    }
+    const cached = crLoadSettingsSnapshot(roomId);
+    if (cached) crSaveSettingsSnapshot({ ...cached.room, title: nextTitle }, cached.config);
+    renderRoomList();
+    toast('名称已修改');
+  } catch (e) {
+    toast(`修改失败：${e.message || '网络异常'}`, 3500);
+  } finally {
+    roomTitleEl.disabled = false;
+  }
+}
 
 function crSettingsSnapshotBridge() {
   try { return window.top?.AppSharedData || window.AppSharedData || null; }
@@ -3792,7 +4078,6 @@ function crPopulateSettings(room, cfg = {}) {
   if (document.getElementById('setTtsConnorVoice')) document.getElementById('setTtsConnorVoice').value = crTtsConnorVoice;
   crApplyAmbientVoiceConfig({ ...crCurrentSettingsConfig(), ...cfg });
 
-  document.getElementById('setTitle').value = room.title || '';
   document.getElementById('setContextLimit').value = room.context_limit || room.context_minutes || 30;
   document.getElementById('setAiRounds').value = room.ai_chat_rounds || 1;
   chatroomModel = cfg.aion_model || chatroomModel;
@@ -3809,9 +4094,11 @@ function crPopulateSettings(room, cfg = {}) {
   updateHeaderActions();
 
   const isConnor1v1 = room.type === 'connor_1v1';
+  document.getElementById('settingsOverlay').classList.toggle('is-private-room', isConnor1v1);
   document.getElementById('fieldAiRounds').style.display = isConnor1v1 ? 'none' : '';
   document.getElementById('fieldReplyOrder').style.display = isConnor1v1 ? 'none' : '';
   document.getElementById('fieldAionModel').style.display = isConnor1v1 ? 'none' : '';
+  document.getElementById('fieldAionVoice').style.display = isConnor1v1 ? 'none' : '';
 }
 
 async function openSettings() {
@@ -4388,7 +4675,6 @@ async function saveSettings() {
   const nextConnorModel = document.getElementById('setConnorModel')?.value || chatroomConnorModel || 'Codex';
   const ambient = crAmbientReadInputs();
   const payload = {
-      title: document.getElementById('setTitle').value,
       context_limit: parseInt(document.getElementById('setContextLimit').value) || 30,
       ai_chat_rounds: parseInt(document.getElementById('setAiRounds').value) || 1,
       aion_model: nextAionModel,
@@ -4410,7 +4696,8 @@ async function saveSettings() {
       if (saveError?.status && saveError.status < 500) throw saveError;
       // 超时可能发生在服务器已落盘之后；只读核对避免误报失败。
       const checked = await api(`/rooms/${roomId}/settings`, { timeoutMs: 8000 }).catch(() => null);
-      if (!checked || checked.config?.reply_order !== payload.reply_order || checked.room?.title !== payload.title) {
+      if (!checked || !Object.entries(payload).every(([key, value]) =>
+        (key === 'context_limit' || key === 'ai_chat_rounds' ? checked.room?.[key] : checked.config?.[key]) === value)) {
         throw saveError;
       }
       result = { ok: true, ...checked };
@@ -5280,6 +5567,16 @@ function crOpenDiary() {
   }
 }
 
+function crOpenToyControls() {
+  closeSidebar();
+  if (window.parent !== window && typeof window.parent.openSubPage === 'function') {
+    window.parent.openSubPage('/toys');
+  } else {
+    const returnTo = '/chatroom' + (currentRoom?.id ? '?room=' + encodeURIComponent(currentRoom.id) : '');
+    window.location.href = '/chat?page=%2Ftoys&toyReturn=' + encodeURIComponent(returnTo);
+  }
+}
+
 function renderEmptyChat() {
   roomTitleEl.textContent = '聊天室';
   currentRoom = null;
@@ -5406,6 +5703,8 @@ function connectWS() {
     if (crWs !== ws) return;
     try {
       const data = JSON.parse(e.data);
+      if (data.type === 'generation_stopped') { _crControl.remoteStop(data.data); return; }
+      if (!_crControl.accepts(data)) return;
       if (data.data?.room_id === currentRoom?.id
           && ['chatroom_msg_created', 'chatroom_msg_updated', 'chatroom_msg_deleted'].includes(data.type)) {
         crMessageRevision++;
@@ -5486,7 +5785,7 @@ function connectWS() {
         if (msg.room_id === currentRoom.id) {
           crMessagesById[msg.id] = msg;
           const row = document.querySelector(`[data-msg-id="${msg.id}"]`);
-          if (row) {
+          if (row && !row.classList.contains('ai-text-editing')) {
             const div = document.createElement('div');
             div.innerHTML = msgHTML(msg);
             row.replaceWith(div.firstElementChild);
@@ -5918,7 +6217,7 @@ let imageLongPressState = null;
 let imageLongPressSuppressClickUntil = 0;
 
 function imageInteractionAttrs() {
-  return 'onclick="return openImageFromElement(event, this)" oncontextmenu="showImageSaveMenu(this.src); return false;" onpointerdown="startImageLongPress(event, this.src)" onpointermove="moveImageLongPress(event)" onpointerup="cancelImageLongPress()" onpointerleave="cancelImageLongPress()" onpointercancel="cancelImageLongPress()" draggable="false"';
+  return 'onclick="return openImageFromElement(event, this)" oncontextmenu="showImageSaveMenu(ChatImagePreview.original(this)); return false;" onpointerdown="startImageLongPress(event, ChatImagePreview.original(this))" onpointermove="moveImageLongPress(event)" onpointerup="cancelImageLongPress()" onpointerleave="cancelImageLongPress()" onpointercancel="cancelImageLongPress()" draggable="false"';
 }
 
 function bindImageSaveOnly(img, clickHandler) {
@@ -5950,7 +6249,7 @@ function openImageFromElement(event, img) {
     if (event) event.preventDefault();
     return false;
   }
-  openImageViewer(img.src);
+  openImageViewer(ChatImagePreview.original(img));
   return false;
 }
 
@@ -6172,7 +6471,7 @@ function renderAttachments(atts, options = {}) {
       } else if (/\.(mp3|wav|m4a|aac|ogg)(?:[?#].*)?$/i.test(url)) {
         html += `<audio src="${esc(url)}" controls preload="metadata"></audio>`;
       } else {
-        html += `<img src="${esc(url)}" ${imageInteractionAttrs()}>`;
+        html += `<img ${ChatImagePreview.attributes(url)} ${imageInteractionAttrs()}>`;
       }
     }
   });
@@ -6183,20 +6482,15 @@ function renderAttachments(atts, options = {}) {
 }
 
 async function handleChatroomFileSelect(input) {
-  for (const file of input.files) {
-    const fd = new FormData();
-    fd.append('file', file);
+  const files = Array.from(input.files);
+  input.value = '';
+  for (const file of files) {
     try {
-      const res = await fetch(`${API}/upload`, { method: 'POST', body: fd });
-      const data = await res.json();
-      if (data.error) { toast(data.error); continue; }
-      pendingAttachments.push(data);
+      await ChatImageUpload.add(`${API}/upload`, file, pendingAttachments, renderPreview);
     } catch (err) {
-      toast('上传失败: ' + err.message);
+      toast(err.message);
     }
   }
-  input.value = '';
-  renderPreview();
 }
 
 function renderPreview() {
@@ -6205,14 +6499,17 @@ function renderPreview() {
   area.className = 'preview-area has-files';
   area.innerHTML = pendingAttachments.map((a, i) => {
     const isVideo = String(a.type || '').startsWith('video/') || /\.(mp4|webm|mov)(?:[?#].*)?$/i.test(a.url || '');
+    const src = esc(a.previewUrl || a.url || '');
     const media = isVideo
-      ? `<video src="${a.url}" muted preload="metadata" playsinline></video>`
-      : `<img src="${a.url}">`;
-    return `<div class="preview-item">${media}<button class="preview-remove" onclick="removeChatroomAttachment(${i})">✕</button></div>`;
+      ? `<video src="${src}" muted preload="metadata" playsinline></video>`
+      : `<img src="${src}">`;
+    const status = a.uploading ? `<span style="position:absolute;bottom:0;left:0;right:0;background:#000a;color:white;font-size:11px;text-align:center" role="status">${esc(a.status)}</span>` : '';
+    return `<div class="preview-item">${media}${status}<button class="preview-remove" onclick="removeChatroomAttachment(${i})">✕</button></div>`;
   }).join('');
 }
 
 function removeChatroomAttachment(i) {
+  ChatImageUpload.release(pendingAttachments[i]);
   pendingAttachments.splice(i, 1);
   renderPreview();
 }
@@ -6238,21 +6535,13 @@ document.getElementById('fileInput').addEventListener('change', function() {
 inputEl.addEventListener('paste', async (e) => {
   const items = e.clipboardData && e.clipboardData.items;
   if (!items) return;
-  for (const item of items) {
-    if (!item.type.startsWith('image/')) continue;
-    e.preventDefault();
-    const file = item.getAsFile();
-    if (!file) continue;
-    const fd = new FormData();
-    fd.append('file', file);
+  const files = Array.from(items).filter(item => item.type.startsWith('image/')).map(item => item.getAsFile()).filter(Boolean);
+  if (files.length) e.preventDefault();
+  for (const file of files) {
     try {
-      const res = await fetch(`${API}/upload`, { method: 'POST', body: fd });
-      const data = await res.json();
-      if (data.error) { toast(data.error); continue; }
-      pendingAttachments.push(data);
-      renderPreview();
+      await ChatImageUpload.add(`${API}/upload`, file, pendingAttachments, renderPreview);
     } catch (err) {
-      toast('粘贴上传失败: ' + err.message);
+      toast(err.message);
     }
   }
 });
@@ -6326,8 +6615,7 @@ function escWithImages(str) {
     // Connor 端 /uploads/ 在聊天室对应 /cr-uploads/
     let imgUrl = match[1];
     if (imgUrl.startsWith('/uploads/')) imgUrl = '/cr-uploads/' + imgUrl.slice('/uploads/'.length);
-    const safeUrl = esc(imgUrl);
-    result += `<img class="cr-inline-img" src="${safeUrl}" ${imageInteractionAttrs()} loading="lazy">`;
+    result += `<img class="cr-inline-img" ${ChatImagePreview.attributes(imgUrl)} ${imageInteractionAttrs()}>`;
     lastIdx = imgRe.lastIndex;
   }
   const tail = str.slice(lastIdx);
@@ -6476,15 +6764,10 @@ async function crCapturePhoto() {
   crCloseCamera();
   const resp = await fetch(dataUrl);
   const blob = await resp.blob();
-  const fd = new FormData();
-  fd.append('file', blob, 'photo_' + Date.now() + '.jpg');
+  const photo = new File([blob], 'photo_' + Date.now() + '.jpg', { type: blob.type });
   try {
-    const res = await fetch(`${API}/upload`, { method: 'POST', body: fd });
-    const data = await res.json();
-    if (data.error) { toast(data.error); return; }
-    pendingAttachments.push(data);
-    renderPreview();
-  } catch (err) { toast('上传失败: ' + err.message); }
+    await ChatImageUpload.add(`${API}/upload`, photo, pendingAttachments, renderPreview);
+  } catch (err) { toast(err.message); }
 }
 
 // ══════════════════════════════════════════════════
@@ -6550,6 +6833,7 @@ function _crInitVoiceHoldBtn() {
 }
 
 async function _crVoiceStartRecord(evt) {
+  if (!crRequireModels()) return;
   if (_crVoiceRecording || isSending) return;
   _crVoiceResumeAmbient = false;
   if (crAmbientUseNative && crAmbientCanRun()) {
@@ -6704,6 +6988,7 @@ function _crBuildWav(chunks) {
 }
 
 async function _crVoiceSend(audioBlob, duration) {
+  if (!crRequireModels()) return;
   if (!currentRoom || isSending) return;
 
   // 1. 上传音频
@@ -6734,8 +7019,9 @@ async function _crVoiceSend(audioBlob, duration) {
   // 3. 构建语音附件并发送
   const voiceAtt = { type: 'voice', url: uploadRes.url, duration: Math.round(duration * 10) / 10, transcript };
 
+  const generation = _crControl.begin(currentRoom.id);
   isSending = true;
-  sendBtn.disabled = true;
+  crShowGenerationStop();
 
   const attachments = [voiceAtt.url];
   const voiceAttachmentsFull = [voiceAtt];
@@ -6744,7 +7030,7 @@ async function _crVoiceSend(audioBlob, duration) {
   if (localRow) localRow.dataset.localEcho = '1';
 
   try {
-    const resp = await fetch(`${API}/rooms/${currentRoom.id}/send`, {
+    const resp = await _crControl.fetch(generation, `${API}/rooms/${currentRoom.id}/send`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -6759,26 +7045,17 @@ async function _crVoiceSend(audioBlob, duration) {
       }),
     });
 
-    const reader = resp.body.getReader();
-    const decoder = new TextDecoder();
-    let buffer = '';
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      buffer += decoder.decode(value, { stream: true });
-      const lines = buffer.split('\n');
-      buffer = lines.pop();
-      for (const line of lines) {
-        if (!line.startsWith('data: ')) continue;
-        try { handleSSE(JSON.parse(line.slice(6))); } catch {}
-      }
-    }
-  } catch (err) { toast('发送失败: ' + err.message); }
+    await consumeChatroomSSE(resp);
+  } catch (err) {
+    if (generation.stopped || err.name === 'AbortError') return; toast('发送失败: ' + err.message); }
   finally {
-    isSending = false;
-    sendBtn.disabled = false;
-    endStreamingBubble();
-    crRefocusComposerAfterSend();
+    if (_crControl.isCurrent(generation)) {
+      isSending = false;
+      crShowGenerationSend();
+      endStreamingBubble();
+      crRefocusComposerAfterSend();
+      _crControl.finish(generation);
+    }
   }
 }
 
@@ -7092,8 +7369,10 @@ function crToyCloseEditor() { document.getElementById('crToyEditorOverlay').clas
   // must wait for the room list, reducing startup from many round trips to two.
   const configPromise = api('/config');
   const roomPromise = api('/rooms');
-  const listenerPromise = crAmbientRefreshListenerState().catch(() => null);
-  const modelPromise = fetchCurrentModel(configPromise);
+  // Auxiliary requests must not hold the room list, cached messages or WebSocket hostage.
+  crAmbientRefreshListenerState().then(() => crAmbientSyncRunning()).catch(() => null);
+  fetchCurrentModel(configPromise).catch(() => null).finally(() => { crStartupModelsReady = true; });
+  crLoadProactiveCompanionshipStatus().catch(() => null);
 
   try {
     const cfg = await configPromise;
@@ -7105,9 +7384,6 @@ function crToyCloseEditor() { document.getElementById('crToyEditorOverlay').clas
     chatroomReplyOrder = cfg.reply_order || 'random';
     crApplyAmbientVoiceConfig(cfg);
   } catch(e) {}
-  await listenerPromise;
-  await modelPromise;
-  await crLoadProactiveCompanionshipStatus();
   try {
     rooms = await roomPromise;
     renderRoomList();

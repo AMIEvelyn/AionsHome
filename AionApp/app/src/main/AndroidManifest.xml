@@ -16,6 +16,8 @@
 
     <!-- 保持屏幕常亮（闹铃/监控提醒不错过） -->
     <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <!-- 唤回聊天弹框的两次强震提醒 -->
+    <uses-permission android:name="android.permission.VIBRATE" />
 
     <!-- 前台服务权限（后台保持 WebSocket 连接） -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
@@ -24,6 +26,7 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CAMERA" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
 
     <!-- 通知权限（Android 13+） -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
@@ -117,7 +120,7 @@
         <service
             android:name=".AionPushService"
             android:exported="false"
-            android:foregroundServiceType="dataSync|location|connectedDevice|mediaProjection|camera" />
+            android:foregroundServiceType="dataSync|location|connectedDevice|mediaProjection|camera|mediaPlayback" />
 
         <service
             android:name=".AionNotificationListenerService"

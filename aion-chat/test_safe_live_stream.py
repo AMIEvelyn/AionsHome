@@ -128,6 +128,7 @@ class ConsumeSafeLiveStreamTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_long_text_commands_over_512_chars_are_retained_but_hidden(self):
         commands = (
+            "[SVAKOM:LOOP:" + ";".join(["3,1,2,2,1"] * 63) + "]",
             "[DRAW:" + "d" * 900 + "]",
             "[SELFIE:" + "s" * 900 + "]",
             "[MEMORY:" + "m" * 900 + "]",
@@ -138,6 +139,8 @@ class ConsumeSafeLiveStreamTest(unittest.IsolatedAsyncioTestCase):
             "[WEB_EXTRACT:https://example.com/" + "u" * 900 + "]",
             "[REMINDER:2026-09-04|" + "r" * 900 + "]",
             "[APP_LOCK:social|10|" + "a" * 900 + "]",
+            "[COME_HOME:" + "回来" * 450 + "]",
+            "[LOOK_AT_ME:5|" + "陪我" * 450 + "]",
             "<AUTONOMY_STATE>" + "z" * 900 + "</AUTONOMY_STATE>",
         )
 

@@ -6,6 +6,8 @@ import json, base64, mimetypes, asyncio, shutil, subprocess, os, re, time, uuid
 from functools import lru_cache
 from pathlib import Path
 
+from generation_control import own_stream, own_process
+
 import httpx
 import tempfile
 
@@ -15,6 +17,7 @@ from codex_app_server import (
     build_codex_app_server_command,
     stream_codex_app_server,
 )
+from codex_chat_profile import prepare_chat_model_catalog
 from stream_safety import StreamActivity
 
 # CLI 状态前缀：yield 此前缀的 chunk 会被 _bg_generate 拦截为状态事件，不送入 TTS 和正文
@@ -502,6 +505,7 @@ async def call_siliconflow(messages: list, model: str, meta: dict | None = None,
         payload["max_tokens"] = max_tokens
     async with httpx.AsyncClient(timeout=120) as client:
         async with client.stream("POST", url, json=payload, headers=headers) as resp:
+            own_stream(resp)
             if resp.status_code != 200:
                 body = await resp.aread()
                 try:
@@ -555,6 +559,7 @@ async def call_gemini(messages: list, model: str, meta: dict | None = None, temp
         payload["generationConfig"] = gen_config
     async with httpx.AsyncClient(timeout=120) as client:
         async with client.stream("POST", url, json=payload) as resp:
+            own_stream(resp)
             if resp.status_code != 200:
                 body = await resp.aread()
                 try:
@@ -598,8 +603,11 @@ async def call_aipro(messages: list, model: str, meta: dict | None = None, tempe
         payload["max_tokens"] = max_tokens
     async with httpx.AsyncClient(timeout=120) as client:
         async with client.stream("POST", url, json=payload, headers=headers) as resp:
+            own_stream(resp)
             if resp.status_code != 200:
                 body = await resp.aread()
+                if meta is not None:
+                    meta["provider_error"] = f"HTTP {resp.status_code}: {_decode_relay_body(body)}"
                 yield _decode_relay_body(body)
                 return
             async for line in resp.aiter_lines():
@@ -641,7 +649,7 @@ def _openai_chat_completions_url(base_url: str) -> str:
 
 
 # ── 自定义 OpenAI 兼容中转站 ─────────────────────────
-async def call_custom_openai(messages: list, cfg: dict, meta: dict | None = None, temperature: float | None = None, max_tokens: int | None = None):
+async def call_custom_openai(messages: list, cfg: dict, meta: dict | None = None, temperature: float | None = None, max_tokens: int | None = None, request_timeout: float = 120):
     model = (cfg.get("model") or "").strip()
     url = _openai_chat_completions_url(cfg.get("base_url", ""))
     if not url or not model:
@@ -663,37 +671,56 @@ async def call_custom_openai(messages: list, cfg: dict, meta: dict | None = None
         payload["max_tokens"] = max_tokens
     if cfg.get("use_default_reasoning_effort") is False:
         payload["reasoning_effort"] = cfg.get("reasoning_effort", "high")
-    async with httpx.AsyncClient(timeout=120) as client:
-        async with client.stream("POST", url, json=payload, headers=headers) as resp:
-            if resp.status_code != 200:
-                body = await resp.aread()
-                yield _decode_relay_body(body)
-                return
-            async for line in resp.aiter_lines():
-                data = _openai_sse_data(line)
-                if data is None:
-                    continue
-                if data == "[DONE]":
+    reasoning_status_sent = False
+    content_started = False
+    try:
+        async with httpx.AsyncClient(timeout=request_timeout) as client:
+            async with client.stream("POST", url, json=payload, headers=headers) as resp:
+                own_stream(resp)
+                if resp.status_code != 200:
+                    body = await resp.aread()
+                    if meta is not None:
+                        meta["provider_error"] = f"HTTP {resp.status_code}: {_decode_relay_body(body)}"
+                    yield _decode_relay_body(body)
                     return
-                try:
-                    chunk = json.loads(data)
-                    if isinstance(chunk, dict) and chunk.get("error"):
-                        yield data
+                async for line in resp.aiter_lines():
+                    data = _openai_sse_data(line)
+                    if data is None:
+                        continue
+                    if data == "[DONE]":
                         return
-                    if meta is not None and chunk.get("usage"):
-                        u = chunk["usage"]
-                        meta["prompt_tokens"] = u.get("prompt_tokens", 0)
-                        meta["completion_tokens"] = u.get("completion_tokens", 0)
-                        meta["total_tokens"] = u.get("total_tokens", 0)
-                        meta["raw"] = u
-                    delta = chunk["choices"][0].get("delta", {}) if chunk.get("choices") else {}
-                    reasoning = delta.get("reasoning_content") or delta.get("reasoning")
-                    if meta is not None and reasoning:
-                        meta["reasoning_content"] = meta.get("reasoning_content", "") + str(reasoning)
-                    if delta.get("content"):
-                        yield delta["content"]
-                except:
-                    pass
+                    try:
+                        chunk = json.loads(data)
+                        if isinstance(chunk, dict) and chunk.get("error"):
+                            if meta is not None:
+                                meta["provider_error"] = data
+                            yield data
+                            return
+                        if meta is not None and chunk.get("usage"):
+                            u = chunk["usage"]
+                            meta["prompt_tokens"] = u.get("prompt_tokens", 0)
+                            meta["completion_tokens"] = u.get("completion_tokens", 0)
+                            meta["total_tokens"] = u.get("total_tokens", 0)
+                            meta["raw"] = u
+                        delta = chunk["choices"][0].get("delta", {}) if chunk.get("choices") else {}
+                        reasoning = delta.get("reasoning_content") or delta.get("reasoning")
+                        if reasoning:
+                            if meta is not None:
+                                meta["reasoning_content"] = meta.get("reasoning_content", "") + str(reasoning)
+                            if not reasoning_status_sent and not content_started:
+                                yield f"{CLI_STATUS_PREFIX}正在思考..."
+                                reasoning_status_sent = True
+                            # Reasoning is real stream activity even before visible text.
+                            yield StreamActivity()
+                        if delta.get("content"):
+                            content_started = True
+                            yield delta["content"]
+                    except Exception:
+                        pass
+    except httpx.TimeoutException:
+        if meta is not None:
+            meta["provider_timeout"] = request_timeout
+        raise
 
 # ── Gemini CLI ────────────────────────────────────
 def _find_gemini_script() -> str | None:
@@ -990,6 +1017,7 @@ async def _spawn_cli_process(cmd: list[str], prompt: str, env: dict | None = Non
         env=env,
         limit=8 * 1024 * 1024,
     )
+    own_process(proc)
     proc.stdin.write(prompt.encode("utf-8"))
     await proc.stdin.drain()
     proc.stdin.close()
@@ -1757,9 +1785,21 @@ def _build_codex_chat_environment(base_env: dict | None = None) -> dict:
         if not chat_auth.exists() or desktop_auth.stat().st_mtime_ns > chat_auth.stat().st_mtime_ns:
             shutil.copy2(desktop_auth, chat_auth)
 
+    # Do not inherit desktop task tools/identity when the home server was
+    # launched from a Codex terminal. Repair has its own environment builder.
+    excluded = {
+        "CODEX_APP_TOOLS_PIPE_PATH", "CODEX_THREAD_ID", "CODEX_SESSION_ID",
+        "CODEX_INTERNAL_ORIGINATOR_OVERRIDE", "CODEX_PERMISSION_PROFILE",
+    }
+    environment = {
+        key: value for key, value in (base_env if base_env is not None else os.environ).items()
+        if key not in excluded
+    }
+    if _CODEX_SCRIPT:
+        prepare_chat_model_catalog(chat_home, shutil.which("node") or "node", _CODEX_SCRIPT)
     chat_profile_root = str(chat_home.parent)
     return {
-        **(base_env or os.environ),
+        **environment,
         "NO_COLOR": "1",
         "CODEX_HOME": str(chat_home),
         "HOME": chat_profile_root,
@@ -1778,7 +1818,49 @@ def _build_codex_chat_command(
     overrides = [
         'model_verbosity="high"',
         f"model_instructions_file={json.dumps(str(_CODEX_COMPANION_INSTRUCTIONS_FILE), ensure_ascii=False)}",
+        f"model_catalog_json={json.dumps(str(Path(_CODEX_CHAT_HOME) / 'companion-models.json'), ensure_ascii=False)}",
         f"developer_instructions={json.dumps(_CODEX_CHAT_DEVELOPER_INSTRUCTIONS, ensure_ascii=False)}",
+        "features.shell_tool=false",
+        "features.multi_agent=false",
+        "features.multi_agent_v2=false",
+        "features.code_mode=false",
+        "features.code_mode_only=false",
+        "features.goals=false",
+        "features.sleep_tool=false",
+        "features.plugins=false",
+        "features.apps=false",
+        "features.image_generation=false",
+        "features.skill_search=false",
+        "features.skill_mcp_dependency_install=false",
+        "features.view_image=true",
+        'web_search="disabled"',
+        "tools.experimental_request_user_input.enabled=false",
+        "tools.update_plan.enabled=false",
+        "features.remote_plugin=false",
+        "include_apps_instructions=false",
+        "include_permissions_instructions=false",
+        "include_collaboration_mode_instructions=false",
+        "include_environment_context=false",
+    ]
+    disabled_skills = (
+        tuple(skill_files) if skill_files is not None else _discover_codex_skill_files()
+    )
+    if disabled_skills:
+        overrides.append(_build_disabled_skills_override(disabled_skills))
+
+    return build_codex_app_server_command(node, script, overrides)
+
+
+def _build_codex_sentinel_command(
+    node: str,
+    script: str,
+    skill_files=None,
+) -> list[str]:
+    """Build a small, tool-free Codex profile for latency-sensitive patrols."""
+    overrides = [
+        'model_reasoning_effort="none"',
+        'model_verbosity="low"',
+        'developer_instructions="You are the AionsHome sentinel classifier. Follow the user prompt exactly and return only the requested result. Do not use tools."',
         "features.shell_tool=false",
         "features.multi_agent=false",
         'features.multi_agent_v2={ root_agent_usage_hint_text = "", multi_agent_mode_hint_text = "" }',
@@ -1793,7 +1875,6 @@ def _build_codex_chat_command(
     )
     if disabled_skills:
         overrides.append(_build_disabled_skills_override(disabled_skills))
-
     return build_codex_app_server_command(node, script, overrides)
 
 
@@ -1916,7 +1997,7 @@ async def call_codex_cli(messages: list, model: str, meta: dict | None = None,
     try:
         env = _build_codex_chat_environment()
         async with _codex_semaphore():
-            async for event in stream_codex_app_server(
+            async for event in own_stream(stream_codex_app_server(
                 cmd,
                 env=env,
                 cwd=_CODEX_WORKSPACE,
@@ -1924,7 +2005,7 @@ async def call_codex_cli(messages: list, model: str, meta: dict | None = None,
                 prompt=prompt,
                 image_paths=list(image_paths),
                 reasoning_summary=_codex_reasoning_summary(),
-            ):
+            )):
                 if event.kind == "text_delta" and event.text:
                     yield event.text
                 elif event.kind == "reasoning_delta" and event.text:
@@ -1944,6 +2025,54 @@ async def call_codex_cli(messages: list, model: str, meta: dict | None = None,
         yield "[CodexCLI错误] 无法启动 Codex CLI 进程"
     except Exception as e:
         yield f"[CodexCLI错误] {e}"
+
+
+async def call_codex_sentinel(
+    prompt: str,
+    *,
+    model: str = "gpt-5.6-luna",
+    image_b64: str | None = None,
+    mime_type: str = "image/jpeg",
+    timeout: int = 60,
+) -> str:
+    """Run one isolated Luna sentinel turn through the local Codex login."""
+    if not _CODEX_SCRIPT:
+        raise RuntimeError("未找到 Codex CLI，无法使用 GPT-5.6 Luna 哨兵线路")
+
+    node = shutil.which("node") or "node"
+    command = _build_codex_sentinel_command(node, _CODEX_SCRIPT)
+    env = _build_codex_chat_environment()
+
+    async def _run(workspace: str, image_paths: list[str]) -> str:
+        chunks: list[str] = []
+        async with _codex_semaphore():
+            async for event in stream_codex_app_server(
+                command,
+                env=env,
+                cwd=workspace,
+                model=model,
+                prompt=prompt,
+                image_paths=image_paths,
+                reasoning_summary="none",
+            ):
+                if event.kind == "text_delta" and event.text:
+                    chunks.append(event.text)
+        return "".join(chunks).strip()
+
+    with tempfile.TemporaryDirectory(prefix="aionshome-sentinel-") as temp_dir:
+        image_paths: list[str] = []
+        if image_b64:
+            suffix = mimetypes.guess_extension(mime_type) or ".jpg"
+            image_path = Path(temp_dir) / f"sentinel_input{suffix}"
+            image_path.write_bytes(base64.b64decode(image_b64))
+            image_paths.append(str(image_path))
+        try:
+            return await asyncio.wait_for(
+                _run(temp_dir, image_paths),
+                timeout=max(1, int(timeout)),
+            )
+        except TimeoutError as error:
+            raise RuntimeError(f"GPT-5.6 Luna 哨兵调用超过 {timeout} 秒") from error
 
 
 # ── 非流式调用（收集流式输出） ────────────────────
@@ -2170,7 +2299,7 @@ def with_current_device_context(
     return prepared
 
 
-async def stream_ai(messages: list, model_key: str, meta: dict | None = None, temperature: float | None = None, max_tokens: int | None = None, cancel_event=None, *, include_device_context: bool = True):
+async def stream_ai(messages: list, model_key: str, meta: dict | None = None, temperature: float | None = None, max_tokens: int | None = None, cancel_event=None, *, include_device_context: bool = True, request_timeout: float = 120):
     if include_device_context:
         messages = with_current_device_context(messages)
     model_key = resolve_model_key(model_key)
@@ -2199,6 +2328,7 @@ async def stream_ai(messages: list, model_key: str, meta: dict | None = None, te
     if not cfg.get("vision", True) and _messages_have_images(normalized):
         yield f"{CLI_STATUS_PREFIX}哨兵模型正在识别图片内容..."
         normalized = await _sentinel_describe_images(normalized)
+        yield f"{CLI_STATUS_PREFIX}图片处理完成，正在等待模型回复..."
     async def _raw_chunks():
         if cfg["provider"] == "siliconflow":
             async for chunk in call_siliconflow(normalized, cfg["model"], meta, temperature, max_tokens):
@@ -2213,7 +2343,7 @@ async def stream_ai(messages: list, model_key: str, meta: dict | None = None, te
             async for chunk in call_aipro(normalized, cfg["model"], meta, temperature, max_tokens):
                 yield chunk
         elif cfg["provider"] == "custom_openai":
-            async for chunk in call_custom_openai(normalized, cfg, meta, temperature, max_tokens):
+            async for chunk in call_custom_openai(normalized, cfg, meta, temperature, max_tokens, request_timeout=request_timeout):
                 yield chunk
         elif cfg["provider"] == "gemini_cli":
             async for chunk in call_gemini_cli(normalized, cfg["model"], meta, temperature, max_tokens):

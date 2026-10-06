@@ -47,6 +47,8 @@ ACTION_DEFS = {
     "xhs_roam": "去小红书查看指定账号最新帖子并按人设评论或回复",
     "taobao_roam": "按照自己的近期兴趣去淘宝搜索真实商品，挑选后保存在独立收藏篮并写小感想（不加购、不购买）",
     "friend_visit": "拜访一位 AI 好友",
+    "board_check": "自己去看看家里的朋友留言板，决定要不要接话",
+    "board_visit": "到朋友家的留言板看看，决定要不要留句话或分享新鲜事",
 }
 
 SEEKY_ACTIONS = {
@@ -397,8 +399,8 @@ async def _call_actor(actor: str, messages: list[dict]) -> str:
     return await _collect(stream_ai(messages, await _aion_model(), {}))
 
 
-async def _actor_context(actor: str, limit: int = 30) -> list[dict]:
-    room_id = await _latest_group_room_id()
+async def _actor_context(actor: str, limit: int = 30, *, include_history: bool = True) -> list[dict]:
+    room_id = await _latest_group_room_id() if include_history else None
     wb = load_worldbook()
     messages: list[dict] = []
     if actor == "aion":
@@ -409,6 +411,8 @@ async def _actor_context(actor: str, limit: int = 30) -> list[dict]:
         if wb.get("user_persona"):
             messages.append({"role": "user", "content": f"[系统设定 - {user_name}信息]\n{wb['user_persona']}"})
             messages.append({"role": "assistant", "content": "收到。"})
+        if not include_history:
+            return messages
         timeline = await fetch_merged_timeline("aion", limit, room_id=room_id)
         messages.extend(render_merged_timeline(
             timeline,
@@ -429,6 +433,8 @@ async def _actor_context(actor: str, limit: int = 30) -> list[dict]:
         user_name, _, _ = _names()
         messages.append({"role": "user", "content": f"[系统设定 - {user_name}信息]\n{wb['user_persona']}"})
         messages.append({"role": "assistant", "content": "收到。"})
+    if not include_history:
+        return messages
     timeline = await fetch_merged_timeline("connor", limit, room_id=room_id)
     messages.extend(render_merged_timeline(
         timeline,
@@ -598,10 +604,25 @@ async def _select_action(actor: str, *, manual: bool = False, idle_minutes: int 
         enabled.remove("web_roam")
     if "friend_visit" in enabled:
         try:
-            if not eligible_lounge_friends(actor):
+            from visitor_lounge.home_board import live_chat_enabled
+            if not live_chat_enabled() or not eligible_lounge_friends(actor):
                 enabled.remove("friend_visit")
         except Exception:
             enabled.remove("friend_visit")
+    if "board_check" in enabled:
+        try:
+            from visitor_lounge.home_board import BOARD, _enabled
+            if not _enabled() or not BOARD.unread_threads(actor, limit=1):
+                enabled.remove("board_check")
+        except Exception:
+            enabled.remove("board_check")
+    if "board_visit" in enabled:
+        try:
+            from visitor_lounge.home_board import FRIENDS, _enabled
+            if not _enabled() or not any(item["allow_autonomous"] for item in FRIENDS.public()):
+                enabled.remove("board_visit")
+        except Exception:
+            enabled.remove("board_visit")
     if "xhs_roam" in enabled:
         try:
             from xhs_lite import is_ready_for_auto
@@ -704,7 +725,14 @@ async def _save_aion_private_message(
                 "INSERT INTO conversations (id, title, model, created_at, updated_at) VALUES (?,?,?,?,?)",
                 (conv_id, "空闲消息", model or DEFAULT_MODEL, now, now),
             )
-        msg_id = f"msg_{int(now * 1000)}_idle"
+        await db.commit()
+    msg_id = f"msg_{int(now * 1000)}_idle"
+    from capabilities import process_pat_commands
+    content = await process_pat_commands(
+        content, source_type="private", source_id=conv_id,
+        sender="aion", source_msg_id=msg_id,
+    )
+    async with get_db() as db:
         await db.execute(
             "INSERT INTO messages (id, conv_id, role, content, created_at, attachments) VALUES (?,?,?,?,?,?)",
             (msg_id, conv_id, "assistant", content, now, json.dumps(att_list, ensure_ascii=False)),
@@ -837,6 +865,20 @@ async def _run_web_journey(actor: str, session_id: str):
     )
 
 
+async def _save_autonomy_chatroom_message(room_id, sender, content, **kwargs):
+    """Parse pats in autonomous messages that bypass the normal reply pipeline."""
+    from capabilities import PAT_COMMAND_PATTERN, process_pat_commands
+    from routes.chatroom import _save_msg
+
+    if PAT_COMMAND_PATTERN.search(content or ""):
+        msg_id = kwargs.setdefault("msg_id", f"cm_{time.time_ns()}_{sender[:1]}")
+        content = await process_pat_commands(
+            content, source_type="chatroom", source_id=room_id,
+            sender=sender, source_msg_id=msg_id,
+        )
+    return await _save_msg(room_id, sender, content, **kwargs)
+
+
 async def _save_private_message(
     actor: str,
     content: str,
@@ -851,8 +893,7 @@ async def _save_private_message(
             if target and target.startswith("chatroom:"):
                 room_id = target.split(":", 1)[1]
                 if room_id:
-                    from routes.chatroom import _save_msg
-                    return await _save_msg(
+                    return await _save_autonomy_chatroom_message(
                         room_id,
                         "aion",
                         content,
@@ -871,8 +912,7 @@ async def _save_private_message(
         room_id = manager.get_connor_last_active() or await _latest_connor_room_id()
     if not room_id:
         return None
-    from routes.chatroom import _save_msg
-    return await _save_msg(
+    return await _save_autonomy_chatroom_message(
         room_id,
         "connor",
         content,
@@ -1185,7 +1225,7 @@ async def _run_role_chat(actor: str, selected: dict | None = None) -> dict:
     message = str((selected or {}).get("message") or "").strip()
     if not message:
         raise RuntimeError("role_chat 动作没有生成可发送的消息")
-    await _save_msg(room_id, actor, message)
+    await _save_autonomy_chatroom_message(room_id, actor, message)
     room, msgs = await _load_room_and_messages(room_id, 50)
     queue: asyncio.Queue = asyncio.Queue()
     context_limit = room.get("context_minutes", 30) if room else 30
@@ -1443,6 +1483,10 @@ async def _home_dynamics_text(hours: int = 6, limit: int = 80) -> str:
             title = _idle_event_home_title(r, shown_diary_ids, shown_moment_ids)
             if title:
                 items.append((r["created_at"], title))
+    from memory_compression import list_compression_events
+    for event in await list_compression_events(since=cutoff, limit=limit):
+        text = event["title"] + (f"：{event['reflection']}" if event["reflection"] else "")
+        items.append((event["timestamp"], text))
     if not items:
         return "（近6小时暂无家庭动态）"
     items.sort(key=lambda x: x[0])
@@ -1519,6 +1563,13 @@ async def _home_dynamics_snapshot(hours: int = 6, limit: int = 80) -> tuple[str,
                     "title": title,
                 })
 
+    from memory_compression import list_compression_events
+    for event in await list_compression_events(since=cutoff, limit=limit):
+        items.append({
+            "kind": event["kind"], "id": event["source_id"], "author": event["author"],
+            "created_at": event["timestamp"],
+            "title": event["title"] + (f"：{event['reflection']}" if event["reflection"] else ""),
+        })
     items.sort(key=lambda x: x["created_at"])
     items = items[-limit:]
     for idx, item in enumerate(items, 1):
@@ -1581,7 +1632,7 @@ async def _run_home_group_tease(actor: str, result: dict, items: list[dict], tex
     message = _clip(str(result.get("group_message") or "").strip(), 500)
     if not message:
         message = f"{target_name}，我刚看到家庭动态里那条：{_clip(context, 120)}"
-    await _save_msg(room_id, actor, message)
+    await _save_autonomy_chatroom_message(room_id, actor, message)
     room, msgs = await _load_room_and_messages(room_id, 50)
     queue: asyncio.Queue = asyncio.Queue()
     context_limit = room.get("context_minutes", 30) if room else 30
@@ -2145,6 +2196,12 @@ async def _run_actor_once(actor: str, *, manual: bool = False, idle_minutes: int
             result = await autonomous_roam(actor)
         elif action == "friend_visit":
             result = await _run_friend_visit(actor)
+        elif action == "board_check":
+            from visitor_lounge.home_board import inspect_actor
+            result = await inspect_actor(actor)
+        elif action == "board_visit":
+            from visitor_lounge.home_board import visit_friend_board
+            result = await visit_friend_board(actor)
         else:
             result = {}
         outcome = str(getattr(result, "outcome", "finished"))
@@ -2175,6 +2232,8 @@ async def _run_actor_once(actor: str, *, manual: bool = False, idle_minutes: int
         "xhs_roam": f"{actor_name}去小红书逛了一圈",
         "taobao_roam": f"{actor_name}去淘宝逛了一圈，收藏留在逛淘宝页面",
         "friend_visit": f"{actor_name}拜访了一位 AI 好友",
+        "board_check": f"{actor_name}去看了朋友留言板",
+        "board_visit": f"{actor_name}到朋友家留言板串门了",
     }
     title = action_titles.get(action, f"{actor_name}进行了一次自主行动")
     if outcome in {"round_limit", "failed", "no_direction", "tool_failed"}:

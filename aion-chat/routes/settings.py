@@ -3,6 +3,7 @@
 """
 
 import json
+import re
 
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import Response, FileResponse
@@ -11,8 +12,8 @@ from typing import Any, Dict, Optional
 
 import httpx
 
-from config import SETTINGS, save_settings, get_key, get_sentinel_config, load_worldbook, save_worldbook, load_chat_status, TTS_CACHE_DIR, TTS_CACHE_MAX_BYTES, THEATER_TTS_CACHE_DIR, normalize_custom_model_routes, normalize_model_transport_modes, refresh_custom_models, iter_visible_models, resolve_model_transport_mode, model_supports_safe_live
-from tts import cleanup_tts_cache_dir
+from config import SETTINGS, save_settings, get_key, get_sentinel_config, load_worldbook, save_worldbook, load_chat_status, TTS_CACHE_DIR, TTS_CACHE_MAX_BYTES, THEATER_TTS_CACHE_DIR, normalize_custom_model_routes, normalize_model_transport_modes, normalize_sentinel_route, refresh_custom_models, iter_visible_models, resolve_model_transport_mode, model_supports_safe_live
+from tts import cleanup_tts_cache_dir, _request_tts_audio, EDGE_VOICES, MINIMAX_TTS_MODELS, MINIMAX_VOICE_PREFIX
 from ws import manager
 
 router = APIRouter()
@@ -39,10 +40,15 @@ async def list_models():
 class SettingsUpdate(BaseModel):
     gemini_key: Optional[str] = None
     siliconflow_key: Optional[str] = None
+    minimax_tts_key: Optional[str] = None
+    minimax_tts_model: Optional[str] = None
+    minimax_aion_voice_id: Optional[str] = None
+    minimax_connor_voice_id: Optional[str] = None
     gemini_free_key: Optional[str] = None
     aipro_key: Optional[str] = None
     tavily_api_key: Optional[str] = None
     netease_music_u: Optional[str] = None
+    sentinel_route: Optional[str] = None
     sentinel_base_url: Optional[str] = None
     sentinel_api_key: Optional[str] = None
     sentinel_model: Optional[str] = None
@@ -97,13 +103,25 @@ async def get_settings():
         if not k or len(k) < 8:
             return k
         return k[:4] + "*" * (len(k) - 8) + k[-4:]
+    try:
+        from chatroom import get_chatroom_names
+        _user_name, minimax_aion_name, minimax_connor_name = get_chatroom_names()
+    except Exception:
+        minimax_aion_name, minimax_connor_name = "AI", "第二AI"
     return {
         "gemini_key": SETTINGS.get("gemini_key", ""),
         "siliconflow_key": SETTINGS.get("siliconflow_key", ""),
+        "minimax_tts_key": SETTINGS.get("minimax_tts_key", ""),
+        "minimax_tts_model": SETTINGS.get("minimax_tts_model", "speech-2.8-hd"),
+        "minimax_aion_voice_id": SETTINGS.get("minimax_aion_voice_id", ""),
+        "minimax_connor_voice_id": SETTINGS.get("minimax_connor_voice_id", ""),
+        "minimax_aion_name": minimax_aion_name,
+        "minimax_connor_name": minimax_connor_name,
         "gemini_free_key": SETTINGS.get("gemini_free_key", ""),
         "aipro_key": SETTINGS.get("aipro_key", ""),
         "tavily_api_key": SETTINGS.get("tavily_api_key", ""),
         "netease_music_u": SETTINGS.get("netease_music_u", ""),
+        "sentinel_route": normalize_sentinel_route(SETTINGS.get("sentinel_route")),
         "sentinel_base_url": SETTINGS.get("sentinel_base_url", ""),
         "sentinel_api_key": SETTINGS.get("sentinel_api_key", ""),
         "sentinel_model": SETTINGS.get("sentinel_model", ""),
@@ -122,6 +140,7 @@ async def get_settings():
         "model_transport_modes": normalize_model_transport_modes(SETTINGS.get("model_transport_modes")),
         "gemini_key_masked": mask(SETTINGS.get("gemini_key", "")),
         "siliconflow_key_masked": mask(SETTINGS.get("siliconflow_key", "")),
+        "minimax_tts_key_masked": mask(SETTINGS.get("minimax_tts_key", "")),
         "gemini_free_key_masked": mask(SETTINGS.get("gemini_free_key", "")),
         "aipro_key_masked": mask(SETTINGS.get("aipro_key", "")),
         "tavily_api_key_masked": mask(SETTINGS.get("tavily_api_key", "")),
@@ -150,17 +169,37 @@ async def update_settings(body: SettingsUpdate):
             except (httpx.InvalidURL, ValueError):
                 raise HTTPException(status_code=400, detail="生图 API 地址须为 HTTP(S) 地址，不能包含账号、查询参数或片段")
     SETTINGS.update(image_config)
+    if body.minimax_tts_model is not None and body.minimax_tts_model not in MINIMAX_TTS_MODELS:
+        raise HTTPException(status_code=400, detail="MiniMax 语音模型无效")
+    minimax_voice_pattern = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{7,255}$")
+    for field, label in (
+        ("minimax_aion_voice_id", "第一个 MiniMax 音色 ID"),
+        ("minimax_connor_voice_id", "第二个 MiniMax 音色 ID"),
+    ):
+        value = getattr(body, field)
+        if value is not None and value.strip() and not minimax_voice_pattern.fullmatch(value.strip()):
+            raise HTTPException(status_code=400, detail=f"{label}格式不正确")
     luckin_changed = False
     if body.gemini_key is not None:
         SETTINGS["gemini_key"] = body.gemini_key
     if body.siliconflow_key is not None:
         SETTINGS["siliconflow_key"] = body.siliconflow_key
+    if body.minimax_tts_key is not None:
+        SETTINGS["minimax_tts_key"] = body.minimax_tts_key.strip()
+    if body.minimax_tts_model is not None:
+        SETTINGS["minimax_tts_model"] = body.minimax_tts_model
+    if body.minimax_aion_voice_id is not None:
+        SETTINGS["minimax_aion_voice_id"] = body.minimax_aion_voice_id.strip()
+    if body.minimax_connor_voice_id is not None:
+        SETTINGS["minimax_connor_voice_id"] = body.minimax_connor_voice_id.strip()
     if body.gemini_free_key is not None:
         SETTINGS["gemini_free_key"] = body.gemini_free_key
     if body.aipro_key is not None:
         SETTINGS["aipro_key"] = body.aipro_key
     if body.tavily_api_key is not None:
         SETTINGS["tavily_api_key"] = body.tavily_api_key
+    if body.sentinel_route is not None:
+        SETTINGS["sentinel_route"] = normalize_sentinel_route(body.sentinel_route)
     if body.sentinel_base_url is not None:
         SETTINGS["sentinel_base_url"] = body.sentinel_base_url
     if body.sentinel_api_key is not None:
@@ -459,30 +498,18 @@ class TTSRequest(BaseModel):
 
 @router.post("/api/tts")
 async def tts_synthesize(body: TTSRequest):
-    key = get_key("siliconflow")
-    if not key:
+    if body.voice.startswith(MINIMAX_VOICE_PREFIX) and not get_key("minimax"):
+        return Response(content=json.dumps({"error": "未配置 MiniMax 订阅 Key"}), status_code=400, media_type="application/json")
+    if not body.voice.startswith(("edge:", MINIMAX_VOICE_PREFIX)) and not get_key("siliconflow"):
         return Response(content=json.dumps({"error": "未配置硅基流动 API Key"}), status_code=400, media_type="application/json")
     if not body.text.strip():
         return Response(content=json.dumps({"error": "文本不能为空"}), status_code=400, media_type="application/json")
     if not body.voice:
         return Response(content=json.dumps({"error": "未选择语音"}), status_code=400, media_type="application/json")
     try:
-        async with httpx.AsyncClient(timeout=30) as client:
-            resp = await client.post(
-                "https://api.siliconflow.cn/v1/audio/speech",
-                headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
-                json={
-                    "model": "FunAudioLLM/CosyVoice2-0.5B",
-                    "input": body.text.strip(),
-                    "voice": body.voice,
-                    "response_format": "mp3",
-                    "speed": 1.0,
-                    "gain": 0
-                }
-            )
-        if resp.status_code != 200:
-            return Response(content=json.dumps({"error": f"TTS API 错误: {resp.status_code}"}), status_code=502, media_type="application/json")
-        audio_data = resp.content
+        audio_data = await _request_tts_audio(body.text.strip(), body.voice)
+        if not audio_data:
+            return Response(content=json.dumps({"error": "语音合成失败，请稍后重试"}), status_code=502, media_type="application/json")
         # 如果提供了 msg_id，将音频缓存到服务器
         if body.msg_id:
             import re
@@ -521,9 +548,27 @@ async def theater_tts_audio(msg_id: str):
 
 @router.get("/api/tts/voices")
 async def tts_voice_list():
+    edge_voices = [v for v in EDGE_VOICES if v["uri"] in SETTINGS.get("edge_tts_favorites", [])]
+    minimax_voices = []
+    if get_key("minimax"):
+        try:
+            from chatroom import get_chatroom_names
+            _user_name, aion_name, connor_name = get_chatroom_names()
+        except Exception:
+            aion_name, connor_name = "AI", "第二AI"
+        for voice_id, name in (
+            (str(SETTINGS.get("minimax_aion_voice_id") or "").strip(), aion_name),
+            (str(SETTINGS.get("minimax_connor_voice_id") or "").strip(), connor_name),
+        ):
+            if voice_id:
+                minimax_voices.append({
+                    "uri": f"{MINIMAX_VOICE_PREFIX}{voice_id}",
+                    "customName": f"{name} · 克隆音色",
+                    "provider": "minimax",
+                })
     key = get_key("siliconflow")
     if not key:
-        return {"voices": [], "error": "未配置硅基流动 API Key"}
+        return {"voices": minimax_voices + edge_voices}
     try:
         async with httpx.AsyncClient(timeout=15) as client:
             resp = await client.get(
@@ -531,9 +576,35 @@ async def tts_voice_list():
                 headers={"Authorization": f"Bearer {key}"}
             )
         if resp.status_code != 200:
-            return {"voices": [], "error": "获取音色列表失败"}
+            return {"voices": minimax_voices + edge_voices, "error": "硅基流动音色暂时不可用"}
         data = resp.json()
         voices = data.get("result") or data.get("voices") or data.get("data") or []
-        return {"voices": voices}
+        return {"voices": [{**v, "provider": "siliconflow"} for v in voices] + minimax_voices + edge_voices}
     except Exception as e:
-        return {"voices": [], "error": str(e)}
+        return {"voices": minimax_voices + edge_voices, "error": "硅基流动音色暂时不可用"}
+
+
+@router.get("/api/tts/edge-voices")
+async def edge_voice_catalog():
+    favorites = SETTINGS.get("edge_tts_favorites", [])
+    return {"voices": [{**v, "favorite": v["uri"] in favorites} for v in EDGE_VOICES]}
+
+
+class EdgeVoiceFavorite(BaseModel):
+    voice: str
+    favorite: bool
+
+
+@router.put("/api/tts/edge-voices")
+async def set_edge_voice_favorite(body: EdgeVoiceFavorite):
+    if body.voice not in {v["uri"] for v in EDGE_VOICES}:
+        raise HTTPException(400, "请选择列表中的 Edge 音色")
+    favorites = set(SETTINGS.get("edge_tts_favorites", []))
+    if body.favorite:
+        favorites.add(body.voice)
+    else:
+        favorites.discard(body.voice)
+    updated = {**SETTINGS, "edge_tts_favorites": [v["uri"] for v in EDGE_VOICES if v["uri"] in favorites]}
+    save_settings(updated)
+    SETTINGS["edge_tts_favorites"] = updated["edge_tts_favorites"]
+    return await edge_voice_catalog()

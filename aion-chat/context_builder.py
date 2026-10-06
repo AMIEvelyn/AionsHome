@@ -5,6 +5,8 @@
 
 import json, re, time, asyncio
 from datetime import datetime
+from pathlib import Path
+import sys
 
 import aiosqlite
 
@@ -23,6 +25,7 @@ from capabilities import (
     is_capability_enabled,
 )
 from app_supervision_ai import APP_COMMAND_PATTERN
+from capabilities import PAT_COMMAND_PATTERN, pat_history_command
 from activity import get_device_context_for_prompt
 from memory import (
     instant_digest, recall_memories, build_surfacing_memories,
@@ -42,6 +45,8 @@ SELFIE_CMD_PATTERN = re.compile(r'\[SELFIE:\s*([^\]]+)\]')
 DRAW_CMD_PATTERN = re.compile(r'\[DRAW:\s*([^\]]+)\]')
 POI_SEARCH_PATTERN = re.compile(r'\[POI_SEARCH:([^\]]+)\]')
 TOY_CMD_PATTERN = re.compile(r'\[TOY:(\d|STOP)\]')
+from svakom_ai import DISPLAY_PATTERN as SVAKOM_CMD_PATTERN
+from ankni_ai import DISPLAY_PATTERN as ANKNI_CMD_PATTERN
 PET_CMD_PATTERN = re.compile(r'\[PET:([a-z_\-]+)\]', re.IGNORECASE)
 HOME_CMD_PATTERN = re.compile(r'\[HOME:([^\]]+)\]', re.IGNORECASE)
 BAND_VIBRATE_CMD_PATTERN = re.compile(r'\[BAND_VIBRATE:(single|call)\]', re.IGNORECASE)
@@ -61,11 +66,11 @@ MEMORY_SEARCH_CMD_PATTERN = re.compile(
 _ALL_CMD_PATTERNS = [
     MUSIC_CMD_PATTERN, MOMENT_CMD_PATTERN, MEMORY_CMD_PATTERN, WISH_CMD_PATTERN,
     ACTIVITY_CHECK_PATTERN, SELFIE_CMD_PATTERN, DRAW_CMD_PATTERN, SONG_CMD_PATTERN,
-    POI_SEARCH_PATTERN, TOY_CMD_PATTERN, PET_CMD_PATTERN,
+    POI_SEARCH_PATTERN, TOY_CMD_PATTERN, SVAKOM_CMD_PATTERN, ANKNI_CMD_PATTERN, PET_CMD_PATTERN,
     HOME_CMD_PATTERN, BAND_VIBRATE_CMD_PATTERN, BAND_NOTE_CMD_PATTERN,
     LUCKIN_CMD_PATTERN, TRANSFER_CMD_PATTERN, PRIVATE_WHISPER_CMD_PATTERN,
     WECHAT_MESSAGE_PATTERN, WEB_SEARCH_CMD_PATTERN, WEB_EXTRACT_CMD_PATTERN,
-    APP_COMMAND_PATTERN, MEMORY_SEARCH_CMD_PATTERN,
+    APP_COMMAND_PATTERN, MEMORY_SEARCH_CMD_PATTERN, PAT_COMMAND_PATTERN,
 ]
 
 def strip_tool_commands(text: str) -> str:
@@ -290,7 +295,7 @@ def _build_recall_query(
     recent_messages: list[dict] = None,
     status: str = "",
 ) -> str:
-    """Prefer sentinel clues, falling back to the latest user message."""
+    """Build the vector-recall query from the local route or user message."""
     if isinstance(keywords, str):
         keywords = [k.strip() for k in re.split(r"[,，、\s]+", keywords) if k.strip()]
     keyword_text = " ".join(str(k).strip() for k in (keywords or []) if str(k).strip())
@@ -308,6 +313,18 @@ def _build_recall_query(
     if keyword_text and keyword_text in base:
         return base.strip()
     return f"{base} {keyword_text}".strip()
+
+
+def board_memory_context(actor_id: str, query_text: str = "", *, include_recent: bool = True) -> str:
+    """Read this actor's own留言板经历 for any home chat surface."""
+    try:
+        lounge_src = Path(__file__).resolve().parents[1] / "AionsHome-Visitor-Lounge" / "src"
+        if str(lounge_src) not in sys.path:
+            sys.path.insert(0, str(lounge_src))
+        from visitor_lounge.home_board import memory_context
+        return memory_context(actor_id, query_text, include_recent=include_recent)
+    except Exception:
+        return ""
 
 
 async def build_memory_blocks(
@@ -329,7 +346,7 @@ async def build_memory_blocks(
 
     参数:
       query_text: 最后一条用户消息文本
-      recent_messages: 最近 3 条对话（用于 instant_digest）
+      recent_messages: 最近 3 条对话（用于本地前置路由）
       use_main_memories: 是否使用 Aion 主记忆库
       chatroom_recall_fn: 可选的聊天室记忆召回函数 async (query, keywords) -> list
       chatroom_surfacing_fn: 可选的聊天室背景浮现函数 async (topic, keywords) -> (list, set)
@@ -345,6 +362,9 @@ async def build_memory_blocks(
     """
     now_str = datetime.now().strftime("%Y年%m月%d日  %H:%M:%S")
     time_block = f"系统当前的准确时间是 {now_str}"
+    board_memory = board_memory_context("aion" if use_main_memories else "connor", query_text)
+    if board_memory:
+        time_block += "\n\n" + board_memory
     # 健康数据摘要
     health_text = await build_health_summary()
     if health_text:
@@ -354,13 +374,18 @@ async def build_memory_blocks(
     if skip_digest:
         return {"time_block": time_block, "memory_block": "", "digest_result": {}}
 
-    # 如果没有外部传入 digest_result，自己跑一次
+    # 如果没有外部传入 digest_result，自己生成一次本地前置路由
     if digest_result is None and recent_messages:
         digest_result = await instant_digest(recent_messages)
     elif digest_result is None:
         digest_result = {"is_search_needed": False, "keywords": [], "topic": ""}
 
     recall_keywords = digest_result.get("keywords", [])
+    relevant_board_memory = board_memory_context(
+        "aion" if use_main_memories else "connor",
+        " ".join(str(word) for word in recall_keywords),
+        include_recent=False,
+    )
     topic = digest_result.get("topic", "")
     status = digest_result.get("status", "")
     is_search_needed = digest_result.get("is_search_needed", False)
@@ -479,6 +504,8 @@ async def build_memory_blocks(
         "debug_top6": [_memory_debug_item(m) for m in debug_candidates[:6]],
     })
 
+    if relevant_board_memory:
+        memory_block = (memory_block + "\n\n" if memory_block else "") + relevant_board_memory
     return {
         "time_block": time_block,
         "memory_block": memory_block,
@@ -549,6 +576,8 @@ def _is_model_visible_timeline_message(message: dict) -> bool:
     if message.get("sender") != "system":
         return True
     attachments = _parse_timeline_attachments(message.get("attachments", []))
+    if any(isinstance(a, dict) and a.get('type') in ('svakom_command_notice', 'ankni_command_notice') for a in attachments):
+        return False
     if trip_card(attachments) is not None:
         return True
     explicitly_model_visible = any(
@@ -560,6 +589,95 @@ def _is_model_visible_timeline_message(message: dict) -> bool:
         return True
     content = _sanitize_timeline_content(message.get("content", ""))
     return any(keyword in content for keyword in SYSTEM_MSG_CONTEXT_KEYWORDS)
+
+
+def _pat_history_command(message: dict) -> tuple[str, str] | None:
+    return pat_history_command(message, _parse_timeline_attachments(message.get("attachments", [])))
+
+
+def _inline_pat_order(message: dict) -> dict | None:
+    attachments = _parse_timeline_attachments(message.get("attachments", []))
+    if not any(
+        isinstance(attachment, dict) and attachment.get("type") == "pat"
+        for attachment in attachments
+    ):
+        return None
+    for attachment in attachments:
+        if not isinstance(attachment, dict) or attachment.get("type") != "system_notice_order":
+            continue
+        after_msg_id = str(attachment.get("after_msg_id") or "")
+        try:
+            offset = max(0, int(attachment["inline_offset"]))
+        except (KeyError, TypeError, ValueError):
+            continue
+        if after_msg_id:
+            return {
+                "source_id": after_msg_id,
+                "offset": offset,
+                "before": str(attachment.get("inline_before") or ""),
+                "after": str(attachment.get("inline_after") or ""),
+            }
+    return None
+
+
+def _resolve_inline_pat_offset(content: str, order: dict) -> int:
+    fallback = max(0, min(len(content), int(order.get("offset") or 0)))
+    candidates = []
+    for anchor, place_after in ((order.get("before"), True), (order.get("after"), False)):
+        if not anchor:
+            continue
+        start = 0
+        while True:
+            index = content.find(anchor, start)
+            if index < 0:
+                break
+            candidates.append(index + len(anchor) if place_after else index)
+            start = index + 1
+    return min(candidates, key=lambda value: abs(value - fallback)) if candidates else fallback
+
+
+def _merge_inline_pat_notices(messages: list[dict]) -> list[dict]:
+    """Fold an inline PAT event into its source reply for model-visible chronology."""
+    source_ids = {str(message.get("id") or "") for message in messages}
+    notices_by_source: dict[str, list[tuple[dict, dict]]] = {}
+    inline_notice_ids = set()
+    for message in messages:
+        order = _inline_pat_order(message)
+        if not order or order["source_id"] not in source_ids:
+            continue
+        notices_by_source.setdefault(order["source_id"], []).append((message, order))
+        inline_notice_ids.add(str(message.get("id") or ""))
+
+    if not notices_by_source:
+        return messages
+
+    result = []
+    for message in messages:
+        message_id = str(message.get("id") or "")
+        if message_id in inline_notice_ids:
+            continue
+        notices = notices_by_source.get(message_id)
+        if not notices:
+            result.append(message)
+            continue
+        content = str(message.get("content") or "")
+        positioned = sorted(
+            (
+                _resolve_inline_pat_offset(content, order),
+                (_pat_history_command(notice) or ("", f"（{notice.get('content') or ''}）"))[1],
+            )
+            for notice, order in notices
+        )
+        chunks = []
+        cursor = 0
+        for offset, notice_content in positioned:
+            offset = max(cursor, min(len(content), offset))
+            chunks.append(content[cursor:offset])
+            chunks.append(notice_content)
+            cursor = offset
+        chunks.append(content[cursor:])
+        result.append({**message, "content": "".join(chunks).strip()})
+    return result
 
 
 def _merged_timeline_sources(
@@ -648,7 +766,7 @@ async def _load_model_visible_merged_timeline(
         if who == "aion":
             private_conditions, private_params = source_filters["private"]
             cur = await db.execute(
-                "SELECT role AS sender, content, created_at, attachments "
+                "SELECT id, role AS sender, content, created_at, attachments "
                 "FROM messages "
                 f"WHERE {' AND '.join(private_conditions)} "
                 "ORDER BY created_at",
@@ -662,7 +780,7 @@ async def _load_model_visible_merged_timeline(
         elif who == "connor":
             private_conditions, private_params = source_filters["private"]
             cur = await db.execute(
-                "SELECT m.sender, m.content, m.created_at, m.attachments "
+                "SELECT m.id, m.sender, m.content, m.created_at, m.attachments "
                 "FROM chatroom_messages m "
                 "JOIN chatroom_rooms r ON r.id = m.room_id "
                 f"WHERE {' AND '.join(private_conditions)} "
@@ -677,7 +795,7 @@ async def _load_model_visible_merged_timeline(
         # ── 群聊消息 ──
         group_conditions, group_params = source_filters["group"]
         cur = await db.execute(
-            "SELECT m.sender, m.content, m.created_at, m.attachments "
+            "SELECT m.id, m.sender, m.content, m.created_at, m.attachments "
             "FROM chatroom_messages m "
             "JOIN chatroom_rooms r ON r.id = m.room_id "
             f"WHERE {' AND '.join(group_conditions)} "
@@ -780,6 +898,7 @@ def render_merged_timeline(
         for message in merged
         if _is_model_visible_timeline_message(message)
     ]
+    merged = _merge_inline_pat_notices(merged)
     if not merged:
         return []
 
@@ -817,6 +936,9 @@ def render_merged_timeline(
         message_attachments = _parse_timeline_attachments(
             msg.get("attachments", [])
         )
+        pat_command = _pat_history_command(msg) if sender == "system" else None
+        if pat_command:
+            sender, content = pat_command
         card = trip_card(message_attachments) if sender == "system" else None
         if card is not None:
             content = render_trip_context(

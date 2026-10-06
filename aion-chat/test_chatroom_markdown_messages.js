@@ -45,12 +45,22 @@ function loadMessageRenderer() {
     renderToyAttachments: () => '',
     renderAttachments: () => '',
     timeStr: () => '16:42',
-    window: { LoungeVisitUI: null, ChatroomMarkdown: markdown },
+    window: { LoungeVisitUI: null, ChatroomMarkdown: markdown, SystemNoticeUI: require('./static/system-notice-ui.js') },
   };
   vm.createContext(context);
   vm.runInContext(`${rendererSource}\nthis.renderMessage = msgHTML;`, context);
   return context.renderMessage;
 }
+
+test('old background toy tags in either AI reply become folded display-only notices', () => {
+  for (const sender of ['aion','connor']) {
+    const html = loadMessageRenderer()({id:'old-toy',sender,created_at:1,attachments:[],content:'[SVAKOM:LOOP:4,1,2,2,0]查岗正文'});
+    assert.doesNotMatch(html, /SVAKOM:LOOP/);
+    assert.match(html, /<details class="system-notice-details">/);
+    assert.match(html, /查岗正文/);
+    assert.match(html, /SVAKOM:循环:4秒,慢速旋转伸缩/);
+  }
+});
 
 function renderStreamingMessage(sender = 'aion') {
   const source = fs.readFileSync(path.join(ROOT, 'static', 'chatroom.js'), 'utf8');
@@ -124,6 +134,29 @@ test('user markdown gives plain lines and a heading separate bubbles under one a
   assert.match(html, /<p>先听我说。<\/p>/);
   assert.match(html, /<h1>我的大字报<\/h1>/);
   assert.match(html, /<strong>今天也要开心。<\/strong>/);
+});
+
+test('AI bold closes after Chinese punctuation before the next sentence', () => {
+  const html = loadMessageRenderer()({
+    id: 'ai-cjk-bold', sender: 'connor', created_at: 1, attachments: [],
+    content: '看见了。**那不是“脾气好”，是把所有关系责任都打包退回给她。**什么都依着、不主动找。',
+  });
+  assert.match(html, /看见了。<strong>那不是“脾气好”，是把所有关系责任都打包退回给她。<\/strong>什么都依着/);
+});
+
+test('Chinese bold supports adjacent quotes and nested inline formatting', () => {
+  const markdown = require('./static/chatroom-markdown.js');
+  assert.equal(markdown.render('他说**“先喝水。”**然后起身。'), '<p>他说<strong>“先喝水。”</strong>然后起身。</p>\n');
+  assert.equal(markdown.render('**先*喝水*。**然后**起身。**走走。'), '<p><strong>先<em>喝水</em>。</strong>然后<strong>起身。</strong>走走。</p>\n');
+});
+
+test('Chinese bold compatibility preserves literal code, escapes, and unmatched markers', () => {
+  const markdown = require('./static/chatroom-markdown.js');
+  const literal = '**先喝水。**然后起身。';
+  assert.equal(markdown.render('`' + literal + '`'), '<p><code>' + literal + '</code></p>\n');
+  assert.equal(markdown.render('```\n' + literal + '\n```'), '<pre><code>' + literal + '\n</code></pre>\n');
+  assert.equal(markdown.render(String.raw`\*\*先喝水。\*\*然后起身。`), '<p>' + literal + '</p>\n');
+  assert.equal(markdown.render('先喝水。**然后起身。'), '<p>先喝水。**然后起身。</p>\n');
 });
 
 test('user bubble splitting keeps markdown lists, quotes, and fenced code intact', () => {

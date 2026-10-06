@@ -5,6 +5,12 @@ FastAPI app 创建、lifespan、静态文件挂载、路由注册
 
 import asyncio, json, logging
 from contextlib import asynccontextmanager
+from pathlib import Path
+import sys
+
+_visitor_lounge_src = Path(__file__).resolve().parents[1] / "AionsHome-Visitor-Lounge" / "src"
+if str(_visitor_lounge_src) not in sys.path:
+    sys.path.insert(0, str(_visitor_lounge_src))
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.staticfiles import StaticFiles
@@ -20,7 +26,7 @@ logging.getLogger("uvicorn.access").addFilter(_QuietCamFilter())
 
 # 静默 Windows asyncio ProactorEventLoop 连接重置的噪音日志
 logging.getLogger("asyncio").setLevel(logging.CRITICAL)
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
 
 from config import BASE_DIR, DATA_DIR, PUBLIC_DIR, UPLOADS_DIR, ALBUM_IMAGES_DIR, SONGS_DIR, CODEX_UPLOADS_DIR, SCREENSHOTS_DIR, load_cam_config
 from database import init_db, get_db
@@ -54,6 +60,7 @@ from routes import fund as fund_routes
 from routes import wallpaper as wallpaper_routes
 from routes import playground as playground_routes
 from routes import chatroom as chatroom_routes
+from capabilities import pat_router
 from routes import doudizhu as doudizhu_routes
 from routes import seeky as seeky_routes
 from routes import wallet as wallet_routes
@@ -74,6 +81,7 @@ from routes import sync as sync_routes
 from routes import app_supervision as app_supervision_routes
 from routes import homecoming as homecoming_routes
 from routes import lounge_friends as lounge_friends_routes
+from visitor_lounge.home_board import create_home_board_router, live_chat_enabled
 from routes import lounge_context_bridge as lounge_context_bridge_routes
 from lounge_context_bridge import get_bridge_token
 from routes.security_access import create_security_access_router
@@ -81,10 +89,12 @@ from routes.security_access_report import create_security_access_report_router
 from activity import pc_tracker, pc_display_tracker
 from memory import auto_digest
 from memory_compression import migrate_legacy_daily_capsules
+from memory_compression_scheduler import auto_calendar_compression_loop
 from chatroom import _connor_1v1_auto_digest_loop
 from fund import fund_scheduler
 from music_station import init_music_station
 from autonomy import idle_autonomy_mgr
+from visitor_lounge.board_patrol import board_patrol_mgr
 from persona_evolution import main_ai_persona_evolution_loop, connor_persona_evolution_loop
 from asset_manifest import get_client_asset_manifest
 from home_assistant_events import ha_event_listener
@@ -185,9 +195,11 @@ async def lifespan(app: FastAPI):
     # 自动记忆总结定时任务
     digest_task = asyncio.create_task(_auto_digest_loop())
     cr_digest_task = asyncio.create_task(_connor_1v1_auto_digest_loop())
+    compression_task = asyncio.create_task(auto_calendar_compression_loop())
     persona_evolution_task = asyncio.create_task(main_ai_persona_evolution_loop())
     connor_persona_evolution_task = asyncio.create_task(connor_persona_evolution_loop())
     idle_autonomy_mgr.start()
+    board_patrol_mgr.start()
     ha_event_listener.start()
     wechat_mode_dispatcher.start()
     openclaw_weixin_runtime.start()
@@ -198,10 +210,13 @@ async def lifespan(app: FastAPI):
     await wechat_mode_dispatcher.stop()
     await ha_event_listener.stop()
     idle_autonomy_mgr.stop()
+    await board_patrol_mgr.stop()
     connor_persona_evolution_task.cancel()
     persona_evolution_task.cancel()
     cr_digest_task.cancel()
     digest_task.cancel()
+    compression_task.cancel()
+    await asyncio.gather(compression_task, return_exceptions=True)
     fund_scheduler.stop()
     pc_display_tracker.stop()
     pc_tracker.stop()
@@ -211,6 +226,10 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(lifespan=lifespan)
+
+# 维修室 owns its routes and independent worker; companion chat is unchanged.
+from repair_routes import router as repair_router
+app.include_router(repair_router)
 
 # Static files keep their existing URLs, so browsers must revalidate them. The
 # Android app additionally uses /api/client-assets to share verified objects
@@ -231,7 +250,13 @@ class NoCacheStaticMiddleware(BaseHTTPMiddleware):
                 return Response("wallpaper only available on local network", status_code=403)
         response = await call_next(request)
         if request.url.path.startswith("/static/"):
-            response.headers["Cache-Control"] = "public, max-age=0, must-revalidate"
+            response.headers["Cache-Control"] = "public, max-age=0, must-revalidate, no-transform"
+        elif response.headers.get("content-type", "").split(";", 1)[0] == "text/html":
+            # Cloudflare's injected analytics changes the document hash and
+            # prevents Android from activating the entire verified asset bundle.
+            cache_control = response.headers.get("Cache-Control", "no-store")
+            if "no-transform" not in cache_control.lower():
+                response.headers["Cache-Control"] = cache_control + ", no-transform"
         return response
 
 app.add_middleware(NoCacheStaticMiddleware)
@@ -253,6 +278,16 @@ app.mount("/aion-pet", StaticFiles(directory=str(BASE_DIR.parent / "AionPet")), 
 app.include_router(chat.router)
 app.include_router(cam_routes.router)
 app.include_router(files.router)
+from network_check import router as network_check_router
+app.include_router(network_check_router)
+from chat_thumbnails import create_router as create_chat_thumbnail_router
+app.include_router(create_chat_thumbnail_router({
+    "/uploads/album/": ALBUM_IMAGES_DIR,
+    "/uploads/": UPLOADS_DIR,
+    "/cr-uploads/": CODEX_UPLOADS_DIR,
+    "/public/": PUBLIC_DIR,
+    "/screenshots/": SCREENSHOTS_DIR,
+}, DATA_DIR / "chat_thumbnails"))
 app.include_router(settings.router)
 app.include_router(memories.router)
 app.include_router(voice_routes.router)
@@ -277,6 +312,7 @@ app.include_router(fund_routes.router)
 app.include_router(wallpaper_routes.router)
 app.include_router(playground_routes.router)
 app.include_router(chatroom_routes.router)
+app.include_router(pat_router)
 app.include_router(doudizhu_routes.router)
 app.include_router(seeky_routes.router)
 app.include_router(wallet_routes.router)
@@ -297,6 +333,7 @@ app.include_router(sync_routes.router)
 app.include_router(app_supervision_routes.router)
 app.include_router(homecoming_routes.router)
 app.include_router(lounge_friends_routes.router)
+app.include_router(create_home_board_router())
 get_bridge_token()
 app.include_router(lounge_context_bridge_routes.router)
 app.include_router(create_security_access_router(security_access_service))
@@ -320,6 +357,26 @@ async def home():
 async def chat_page():
     return FileResponse(BASE_DIR / "static" / "chat.html", headers={"Cache-Control": "no-cache, no-store, must-revalidate"})
 
+@app.get("/toys")
+@app.get("/whisper")
+async def whisper_page():
+    return FileResponse(BASE_DIR / "static" / "whisper.html", headers={"Cache-Control": "no-cache, no-store, must-revalidate"})
+
+@app.get("/toys/sosexy")
+@app.get("/whisper/sosexy")
+async def sosexy_toy_page():
+    return FileResponse(BASE_DIR / "static" / "toy-sosexy.html", headers={"Cache-Control": "no-cache, no-store, must-revalidate"})
+
+@app.get("/toys/ankni")
+async def ankni_toy_page():
+    return FileResponse(BASE_DIR / "static" / "toy-ankni.html", headers={"Cache-Control": "no-cache, no-store, must-revalidate"})
+
+
+@app.get("/toys/svakom")
+@app.get("/whisper/svakom")
+async def svakom_toy_page():
+    return FileResponse(BASE_DIR / "static" / "toy-svakom.html", headers={"Cache-Control": "no-cache, no-store, must-revalidate"})
+
 
 @app.get("/album")
 async def album_page():
@@ -339,8 +396,14 @@ async def taobao_page():
 async def settings_page():
     return FileResponse(BASE_DIR / "static" / "settings.html", headers={"Cache-Control": "no-cache, no-store, must-revalidate"})
 
+@app.get("/tts-test")
+async def tts_test_page():
+    return FileResponse(BASE_DIR / "static" / "tts-test.html", headers={"Cache-Control": "no-cache, no-store, must-revalidate"})
+
 @app.get("/lounge-friends")
 async def lounge_friends_page():
+    if not live_chat_enabled():
+        return RedirectResponse("/lounge-board", status_code=307)
     return FileResponse(BASE_DIR / "static" / "lounge-friends.html", headers={"Cache-Control": "no-cache, no-store, must-revalidate"})
 
 @app.get("/capabilities")

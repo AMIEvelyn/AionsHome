@@ -2,7 +2,10 @@
 WebSocket 连接管理器
 """
 
+from generation_control import current_generation, generation_event
+
 import json, logging, time
+from weakref import WeakKeyDictionary
 from fastapi import WebSocket
 from config import load_worldbook
 
@@ -55,6 +58,9 @@ class ConnectionManager:
     def __init__(self):
         self.active: list[WebSocket] = []
         self.tts_clients: dict[WebSocket, dict] = {}  # {ws: {"enabled": bool, "voice": str, "can_play": bool, "active_at": float}}
+        self._tts_message_clients: dict[str, WebSocket] = {}
+        # Keep both speakers on one queue for the lifetime of their reply turn.
+        self._tts_generation_clients = WeakKeyDictionary()
         self._tts_fallback: dict = {}  # {"enabled": bool, "voice": str} — 来自 HTTP 请求的备用 TTS 状态
         self.client_ids: dict[WebSocket, str] = {}     # {ws: client_id} — 客户端唯一标识
         self._last_sender_client_id: str | None = None  # 最后发消息的客户端 ID
@@ -73,6 +79,12 @@ class ConnectionManager:
         if ws in self.active:
             self.active.remove(ws)
         self.tts_clients.pop(ws, None)
+        self._tts_message_clients = {
+            msg_id: owner for msg_id, owner in self._tts_message_clients.items() if owner is not ws
+        }
+        for generation, owner in list(self._tts_generation_clients.items()):
+            if owner is ws:
+                del self._tts_generation_clients[generation]
         self.client_ids.pop(ws, None)
         self.pet_clients.pop(ws, None)
         log.info("WS disconnected, total=%d", len(self.active))
@@ -107,6 +119,7 @@ class ConnectionManager:
         return any(self.pet_clients.values())
 
     async def send_to_client(self, client_id: str, data: dict) -> bool:
+        data = generation_event(data)
         """定向推送消息到指定 client_id 的客户端"""
         msg = json.dumps(data, ensure_ascii=False)
         sent = False
@@ -177,7 +190,19 @@ class ConnectionManager:
         return None
 
     async def send_tts_event(self, data: dict):
-        for ws, state in self._sorted_tts_clients():
+        data = generation_event(data)
+        event_data = data.get("data") or {}
+        msg_id = event_data.get("msg_id", "")
+        owner = self._tts_message_clients.get(msg_id)
+        generation = current_generation()
+        if owner is None and generation is not None:
+            owner = self._tts_generation_clients.get(generation)
+        candidates = self._sorted_tts_clients()
+        # Keep every segment and its completion marker on one playback queue.
+        # tts_done means synthesis finished, not playback. A focus change between
+        # the two speakers must not move the second reply to another phone player.
+        candidates.sort(key=lambda item: item[0] is not owner)
+        for ws, state in candidates:
             if ws not in self.active or not state.get("enabled") or not state.get("can_play", True):
                 continue
             payload = json.loads(json.dumps(data, ensure_ascii=False))
@@ -185,16 +210,28 @@ class ConnectionManager:
                 payload["data"]["target_client_id"] = self.client_ids.get(ws, "")
             try:
                 await ws.send_text(json.dumps(payload, ensure_ascii=False))
-                return
+                if generation is not None:
+                    self._tts_generation_clients[generation] = ws
+                if msg_id and data.get("type") == "tts_chunk":
+                    self._tts_message_clients[msg_id] = ws
+                    # Cancelled generations may never send tts_done.
+                    while len(self._tts_message_clients) > 256:
+                        self._tts_message_clients.pop(next(iter(self._tts_message_clients)))
+                elif data.get("type") == "tts_done":
+                    self._tts_message_clients.pop(msg_id, None)
+                return payload
             except Exception as e:
                 log.warning("WS send_tts_event failed: %s", e)
                 if ws in self.active:
                     self.active.remove(ws)
                 self.tts_clients.pop(ws, None)
                 self.client_ids.pop(ws, None)
+        if data.get("type") == "tts_done":
+            self._tts_message_clients.pop(msg_id, None)
         log.debug("TTS event dropped because no playable client is active: %s", data.get("type"))
 
     async def broadcast(self, data: dict, exclude: WebSocket = None):
+        data = generation_event(data)
         proactive_changed = False
         autonomy_changed = False
         try:

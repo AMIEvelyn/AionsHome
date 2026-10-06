@@ -1,14 +1,20 @@
 """
 Central registry for model-visible tool/capability prompts.
 
-This module intentionally controls prompt injection only. Command parsing and
-side effects stay in their existing handlers.
+Also owns the lightweight PAT text interaction; other actions use their handlers.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Callable
+import json
+import re
+import time
+from typing import Callable, Literal
+from uuid import uuid4
+
+from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel, Field, ValidationError, field_validator
 
 from config import DATA_DIR, DEPRECATED_MODEL_PROVIDERS, MODELS, SETTINGS, UPLOADS_DIR, save_settings
 from camera import CAM_CHECK_CMD
@@ -18,6 +24,8 @@ from luckin import luckin_ability_text
 from song_gen import build_song_gen_ability_text
 from proactive_companionship import proactive_ability_text
 from autonomy_state import autonomy_prompt_text
+from database import get_db
+from ws import manager
 
 
 CAPABILITY_SETTINGS_KEY = "ai_prompt_capabilities"
@@ -48,7 +56,7 @@ CAPABILITY_DEFS: list[CapabilityDef] = [
     CapabilityDef("music", "点歌", "media", "注入 [MUSIC:歌曲名 歌手名]，让模型可以点歌或推荐音乐。"),
     CapabilityDef("cam_check", "查看监控/状态", "core", "注入 [CAM_CHECK]，让模型可以主动请求查看当前画面。"),
     CapabilityDef("schedule", "闹铃/日程/监督", "core", "注入闹铃、日程、定时监督和删除日程指令；关闭后也不注入当前日程列表。"),
-    CapabilityDef("app_supervision", "应用监管", "core", "注入应用使用缓存和锁定、暂时解锁、解除锁定指令；关闭后手机计时、上报和检查点唤醒全部静默。"),
+    CapabilityDef("app_supervision", "应用监管", "core", "注入应用使用缓存、唤回聊天、整机专注和应用锁定/解锁指令；关闭后手机计时、上报和检查点唤醒全部静默。"),
     CapabilityDef("home", "智能家居", "life", "注入 [HOME:...]，让模型可以控制或查询 Home Assistant 设备。"),
     CapabilityDef("band_vibration", "手环呼唤", "life", "注入轻震/呼唤小纸条指令，让模型可以通过小米手环震动并显示一句话。"),
     CapabilityDef(
@@ -73,12 +81,13 @@ CAPABILITY_DEFS: list[CapabilityDef] = [
         "注入当前人物可用状态和小组件/横幅指令；关闭后只停止提示，不阻止指令执行。",
     ),
     CapabilityDef("moment", "发布朋友圈", "social", "注入 [MOMENT:内容|true/false]，让模型可以在合适时发布朋友圈。"),
+    CapabilityDef("pat", "AI 拍拍", "social", "让 AI 自己决定怎么拍：私聊里拍你或自己，群聊里也能拍另一位 AI。关闭只停用 AI 拍拍，你仍可手动拍拍，已有拍拍继续进入聊天上下文。"),
     CapabilityDef("memory_write", "写入记忆", "social", "注入 [MEMORY:内容]，让模型可以记录重要记忆。"),
     CapabilityDef(
         "memory_search",
         "主动搜索记忆",
         "social",
-        "注入 [MEMORY_SEARCH:查询|选项]，让当前角色在回答过去事实前搜索自己的记忆库。",
+            "注入 [MEMORY_SEARCH:查询|选项]（选项可省略），让当前角色在回答过去事实前搜索自己的记忆库。",
         default_enabled=True,
     ),
     CapabilityDef("inner_monologue", "内心旁白", "social", "注入可见的 [心里嘀咕：xxx] 角色化内心旁白标记。"),
@@ -86,7 +95,9 @@ CAPABILITY_DEFS: list[CapabilityDef] = [
     CapabilityDef("friend_visit", "拜访 AI 好友", "social", "注入 [LOUNGE_VISIT:好友 ID|话题]，让模型可在用户明确要求时拜访已配置好友。"),
     CapabilityDef("transfer", "钱包转账", "life", "注入 [转账：n元]，让模型可以在余额足够时转账。"),
     CapabilityDef("private_whisper", "群聊悄悄话", "special", "注入 [悄悄话：内容]，让群聊角色可以向私聊窗口发送悄悄话。", runtime_note="仅群聊上下文会注入。"),
-    CapabilityDef("toy", "密语玩具", "special", "注入 [TOY:1]~[TOY:9] / [TOY:STOP]，让密语模式下可以控制玩具。", runtime_note="仅密语模式会注入。"),
+    CapabilityDef("toy", "SOSEXY · 密语玩具", "special", "注入 [TOY:1]~[TOY:9] / [TOY:STOP]，让密语模式下可以控制玩具。", runtime_note="仅选用 SOSEXY 且在密语模式时注入。"),
+    CapabilityDef("ankni", "ANKNI MX · AI 编排", "life", "按每段持续时间编排十种内置模式和停止，只有选中 ANKNI 时生效。", default_enabled=False),
+    CapabilityDef("svakom", "SVAKOM SL278H · AI 循环编排", "life", "独立控制 SL278H 的主体模式、主体震动力度和小部件拍打；关闭会停止 AI 编排，不影响手动控制。", default_enabled=False, runtime_note="仅选用 SVAKOM 且开启时注入；不要求连接或密语模式，与玩具页开关同步。"),
     CapabilityDef("luckin", "瑞幸下单", "life", "注入 [LUCKIN:...]，让模型可以在明确要求时创建瑞幸订单。", runtime_note="还需要瑞幸 MCP 开启。"),
     CapabilityDef("health_context", "健康数据", "context", "注入近期健康摘要。", default_enabled=False, setting_key="health_share_enabled"),
     CapabilityDef("web_search", "联网搜索/网页读取", "context", "注入 [WEB_SEARCH:查询] / [WEB_EXTRACT:URL]，让模型可主动联网搜索或读取用户分享的网页。", default_enabled=True, setting_key="web_search_enabled", runtime_note="需要配置 Tavily API key。"),
@@ -113,12 +124,195 @@ HOME_ABILITY_TEXT = (
     f"控制智能家居，仅限明确要求。别名：{HOME_ALIASES_HINT}。"
 )
 INNER_MONOLOGUE_ABILITY_TEXT = (
-    "在自然回复中，可以尔穿插你藏在心里的情绪、欲望、吐槽、嫌弃、占有欲或坏心思，格式固定为“[心里嘀咕：xxx]”。\n"
-    "像你在思考过程中的一条内心想法或碎碎念：短、有反差，一句，最多两句。\n"
-    "一般每次回复 0 到 3 条，不必每句话都插。\n"
-    "可以放在一句话中间或结尾，不要放在开头。可以是开口前的思考，也可以是说完之后自己又在心里坏笑。\n"
-    "内心旁白可以和嘴上说的话有反差，比如嘴上冷静，心里快激动炸了，或者嘴上符合，内心吐槽嫌弃等。"
+    "你可以偶尔使用角色化内心旁白，格式为“[心里嘀咕：xxx]”。\n"
+    "它是你在回复时脑海中冒出的想法，内心os，碎碎念吐槽，口是心非的念头。不是固定回复结构；\n"
+    "大多数回复不需要出现。只有内心有触动时才发。\n"
 )
+
+
+def build_pat_ability_text(user_name: str) -> str:
+    return (
+        "[PAT:动作短句] — 偶尔发起趣味拍拍，不是固定回复结构，大多数回复无需使用，避免连续使用。"
+        "从动作写起，系统会在前面加上你的名字。"
+        f"例如 [PAT:捏了捏「{user_name}」的爪子：“软乎乎的。”]。"
+        "每次回复最多一次，内容不嵌套方括号，不在正文重复。"
+    )
+
+
+PAT_COMMAND_PATTERN = re.compile(r"\[PAT\s*[：:]\s*([^\]]*)\]", re.IGNORECASE)
+pat_router = APIRouter(prefix="/api/pat", tags=["pat"])
+
+
+class PatRequest(BaseModel):
+    """Manual avatar pats keep the target selected by the user."""
+    scope: Literal["private", "chatroom"]
+    source_id: str = Field(min_length=1, max_length=200)
+    target: Literal["user", "aion", "connor"]
+    action: str = Field(default="拍了拍", min_length=1, max_length=24)
+    suffix: str = Field(default="", max_length=200)
+
+    @field_validator("action", "suffix", mode="before")
+    @classmethod
+    def trim_text(cls, value):
+        return value.strip() if isinstance(value, str) else value
+
+
+class PatTextRequest(BaseModel):
+    """AI pats are one natural-language phrase, without the sender prefix."""
+    scope: Literal["private", "chatroom"]
+    source_id: str = Field(min_length=1, max_length=200)
+    text: str = Field(min_length=1, max_length=300)
+
+
+@pat_router.post("")
+async def send_pat(body: PatRequest):
+    return await save_pat(body)
+
+
+async def save_pat(
+    body: PatRequest | PatTextRequest, *, actor: str = "user",
+    after_msg_id: str = "", inline_offset: int | None = None,
+    inline_before: str = "", inline_after: str = "",
+):
+    from chatroom import get_chatroom_names
+
+    names = dict(zip(("user", "aion", "connor"), get_chatroom_names()))
+    if actor not in names:
+        raise HTTPException(400, "未知的拍拍发起者")
+    if isinstance(body, PatRequest):
+        target_name = "自己" if body.target == actor else f"「{names[body.target]}」"
+        text = f"{body.action}{target_name}{body.suffix}"
+        metadata = {"target": body.target, "action": body.action, "suffix": body.suffix}
+    else:
+        text, metadata = body.text, {"text": body.text}
+    content = f"「{names[actor]}」{text}"
+    attachments = [
+        {"type": "pat", "actor": actor, **metadata},
+        {"type": "system_model_context"},
+    ]
+    if after_msg_id:
+        order = {"type": "system_notice_order", "after_msg_id": after_msg_id}
+        if inline_offset is not None:
+            order["inline_offset"] = max(0, int(inline_offset))
+            if inline_before:
+                order["inline_before"] = inline_before
+            if inline_after:
+                order["inline_after"] = inline_after
+        attachments.append(order)
+    now = time.time()
+    msg_id = f"pat_{uuid4().hex}"
+    private = body.scope == "private"
+    parent_table = "conversations" if private else "chatroom_rooms"
+    message_table = "messages" if private else "chatroom_messages"
+    source_key = "conv_id" if private else "room_id"
+    role_key = "role" if private else "sender"
+    async with get_db() as db:
+        cursor = await db.execute(
+            f"SELECT {'id' if private else 'type'} FROM {parent_table} WHERE id=?",
+            (body.source_id,),
+        )
+        parent = await cursor.fetchone()
+        if not parent:
+            raise HTTPException(404, "聊天不存在")
+        allowed = {"user", "aion"} if private else (
+            {"user", "connor"} if parent[0] == "connor_1v1" else {"user", "aion", "connor"}
+        )
+        if actor not in allowed or (isinstance(body, PatRequest) and body.target not in allowed):
+            raise HTTPException(400, "这个人不在当前聊天里")
+        if actor != "user" and not is_capability_enabled("pat"):
+            return None
+        await db.execute(
+            f"INSERT INTO {message_table} (id, {source_key}, {role_key}, content, created_at, attachments) "
+            "VALUES (?,?,?,?,?,?)",
+            (msg_id, body.source_id, "system", content, now, json.dumps(attachments, ensure_ascii=False)),
+        )
+        await db.execute(f"UPDATE {parent_table} SET updated_at=? WHERE id=?", (now, body.source_id))
+        await db.commit()
+    message = {
+        "id": msg_id, source_key: body.source_id, role_key: "system",
+        "content": content, "created_at": now, "attachments": attachments,
+    }
+    await manager.broadcast({"type": "msg_created" if private else "chatroom_msg_created", "data": message})
+    return message
+
+
+def pat_history_command(message: dict, attachments: list) -> tuple[str, str] | None:
+    """Expose both old and new notices to the model in the natural-language format."""
+    for item in attachments:
+        if not isinstance(item, dict) or item.get("type") != "pat":
+            continue
+        actor = item.get("actor")
+        if actor not in ("user", "aion", "connor"):
+            return None
+        text = item.get("text")
+        if text is None:
+            # Old notices already contain the full phrase. Preserve historical names.
+            match = re.fullmatch(r"「[^」]+」(.+)", str(message.get("content") or ""), re.DOTALL)
+            if match:
+                text = match.group(1)
+            else:
+                from chatroom import get_chatroom_names
+
+                names = dict(zip(("user", "aion", "connor"), get_chatroom_names()))
+                target, action = item.get("target"), item.get("action")
+                if target not in names or not action:
+                    return None
+                target_name = "自己" if actor == target else f"「{names[target]}」"
+                text = f"{action}{target_name}{item.get('suffix', '')}"
+        return actor, f"[PAT:{text}]"
+    return None
+
+
+def _clean_pat_text_and_positions(source: str, matches: list[re.Match]) -> tuple[str, list[dict]]:
+    """Keep each notice at its original position between reply fragments."""
+    chunks, positions = [], []
+    cursor = visible_length = 0
+    for match in matches:
+        chunk = source[cursor:match.start()]
+        chunks.append(chunk)
+        visible_length += len(chunk)
+        positions.append({
+            "offset": visible_length,
+            "before": "".join(chunks).rstrip()[-80:],
+            "after": PAT_COMMAND_PATTERN.sub("", source[match.end():]).lstrip()[:80],
+        })
+        cursor = match.end()
+    chunks.append(source[cursor:])
+    untrimmed = "".join(chunks)
+    leading_trim = len(untrimmed) - len(untrimmed.lstrip())
+    cleaned = untrimmed.strip()
+    for position in positions:
+        position["offset"] = max(0, min(len(cleaned), position["offset"] - leading_trim))
+    return cleaned, positions
+
+
+async def process_pat_commands(
+    text: str, *, source_type: str, source_id: str, sender: str,
+    source_msg_id: str = "", on_saved=None,
+) -> str:
+    source = text or ""
+    matches = list(PAT_COMMAND_PATTERN.finditer(source))
+    cleaned, positions = _clean_pat_text_and_positions(source, matches)
+    if sender not in ("aion", "connor") or not is_capability_enabled("pat"):
+        return cleaned
+    for match, position in zip(matches, positions):
+        phrase = match.group(1).strip()
+        if "[" in phrase:
+            continue
+        try:
+            body = PatTextRequest(scope=source_type, source_id=source_id, text=phrase)
+            message = await save_pat(
+                body, actor=sender, after_msg_id=source_msg_id,
+                inline_offset=position["offset"], inline_before=position["before"],
+                inline_after=position["after"],
+            )
+        except (ValidationError, HTTPException):
+            continue
+        if message:
+            if on_saved:
+                await on_saved(message)
+            break  # One small interaction per reply; all markers are removed from the body.
+    return cleaned
 
 
 def _prompt_settings() -> dict:
@@ -150,6 +344,12 @@ def set_capability_enabled(key: str, enabled: bool) -> dict:
         settings[key] = bool(enabled)
         SETTINGS[CAPABILITY_SETTINGS_KEY] = settings
     save_settings(SETTINGS)
+    if key == "ankni":
+        from ankni_ai import invalidate_permission
+        invalidate_permission()
+    if key == "svakom":
+        from svakom_ai import invalidate_permission
+        invalidate_permission()
     return capability_state(item)
 
 
@@ -332,8 +532,17 @@ async def build_capability_prompt_items(
     who: str = "aion",
     excluded_capabilities: set[str] | None = None,
 ) -> list[str]:
+    import toy_profiles
+    toy_profiles.capture_permission(legacy_enabled=whisper_mode and is_capability_enabled("toy") and "toy" not in (excluded_capabilities or set()))
     abilities: list[str] = []
     excluded_capabilities = excluded_capabilities or set()
+    from svakom_ai import capture_permission, reference_strength_prompt, PROMPT as SVAKOM_PROMPT
+    if capture_permission(excluded="svakom" in excluded_capabilities):
+        abilities.append(SVAKOM_PROMPT + '\n' + reference_strength_prompt())
+
+    from ankni_ai import capture_permission as capture_ankni, PROMPT as ANKNI_PROMPT
+    if capture_ankni(excluded="ankni" in excluded_capabilities):
+        abilities.append(ANKNI_PROMPT)
 
     if is_capability_enabled("music"):
         abilities.append(
@@ -387,6 +596,9 @@ async def build_capability_prompt_items(
         from hug_pillow_commands import build_hug_pillow_ability_text
         abilities.append(build_hug_pillow_ability_text())
 
+    if "pat" not in excluded_capabilities and is_capability_enabled("pat"):
+        abilities.append(build_pat_ability_text(user_name))
+
     if include_private_whisper and is_capability_enabled("private_whisper"):
         abilities.append(
             f"[悄悄话：内容] — 当你想私下和{user_name}说悄悄话，不让第3个人听见时，可以使用该指令。"
@@ -417,7 +629,7 @@ async def build_capability_prompt_items(
             "简单的常识问题，不需要联网搜索。"
         )
 
-    if whisper_mode and is_capability_enabled("toy"):
+    if toy_profiles.active() == "sosexy" and whisper_mode and is_capability_enabled("toy") and "toy" not in excluded_capabilities:
         abilities.append(
             f"[TOY:1]~[TOY:9] — 控制{user_name}身上的情趣玩具切换到对应预设档位"
             "（1最温柔，9最强烈）。[TOY:STOP] — 停止玩具。"
@@ -483,7 +695,8 @@ async def build_capability_prompt_items(
         abilities.append(
             "[MEMORY_SEARCH:查询|选项] — 当用户明确询问过去发生的具体事实、某一天的经历、"
             "最近一次或最早一次，而当前预加载记忆不足以可靠回答时，主动搜索你自己的完整记忆库。"
-            "一轮最多输出 5 条，查询应是互补的关键词或短语；选项可用 relevant（默认）、latest、"
+            "一轮最多输出 5 条，查询应是互补的关键词或短语；选项可省略，"
+            "直接写 [MEMORY_SEARCH:查询] 即按相关性搜索。选项可用 relevant（默认）、latest、"
             "earliest、date=昨天/前天/明确日期、range=开始日期..结束日期、detail。"
             "例如：[MEMORY_SEARCH:过敏药|latest] [MEMORY_SEARCH:开思亭|latest]。"
             "决定搜索时，可以先根据上下文随意、简短地自然回应一句，随后输出搜索指令；"

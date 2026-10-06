@@ -3,6 +3,7 @@ let currentConvId = null;
 let currentMessages = [];
 let serverMessageIds = new Set();
 let models = [];
+let privateModelReady = Promise.resolve();
 const DEPRECATED_MODEL_PROVIDERS = new Set(["gemini_cli", "antigravity_cli"]);
 let sending = false;
 let streamingAiId = null;
@@ -116,8 +117,13 @@ window.addEventListener('storage', e => {
 
 // ── 初始化 ──
 async function init() {
+  const modelReady = privateModelReady = api("GET", "/api/models").then(result => {
+    models = result;
+    const selected = conversations.find(c => c.id === currentConvId)?.model || $("modelSelect").value;
+    renderModelSelect();
+    if (selected) $("modelSelect").value = selected;
+  }).catch(e => console.warn('加载模型列表失败:', e));
   const bootstrap = Promise.all([
-    api("GET", "/api/models"),
     api("GET", "/api/worldbook"),
     api("GET", "/api/conversations"),
   ]);
@@ -125,8 +131,7 @@ async function init() {
     .then(config => { chatroomConfig = config; })
     .catch(() => { chatroomConfig = {}; });
   loadProactiveCompanionshipStatus();
-  [models, worldBook, conversations] = await bootstrap;
-  renderModelSelect();
+  [worldBook, conversations] = await bootstrap;
   const initParams = new URLSearchParams(location.search);
   const targetConvId = initParams.get('conv');
   const targetMsgId = initParams.get('msg');
@@ -141,6 +146,7 @@ async function init() {
   } else if (lastId && conversations.find(c => c.id === lastId)) {
     await selectConv(lastId);
   } else if (conversations.length === 0) {
+    await modelReady; // A brand-new conversation still needs its initial model.
     await newConversation();
   } else {
     renderConvList();
@@ -241,7 +247,7 @@ function formatMsg(s) {
   while ((match = imgRe.exec(processed)) !== null) {
     result += processed.slice(lastIdx, match.index).replace(/\n/g, '<br>');
     const safeUrl = match[1];
-    result += `<img class="cr-inline-img" src="${safeUrl}" ${imageInteractionAttrs()} loading="lazy" style="max-width:100%;border-radius:8px;cursor:pointer;margin:4px 0">`;
+    result += `<img class="cr-inline-img" ${ChatImagePreview.attributes(safeUrl, true)} ${imageInteractionAttrs()}>`;
     lastIdx = imgRe.lastIndex;
   }
   result += processed.slice(lastIdx).replace(/\n/g, '<br>');
@@ -252,6 +258,7 @@ function formatMsg(s) {
 function toggleConfig(e) {
   e.stopPropagation();
   $("configPopup").classList.toggle("show");
+  if ($('configPopup').classList.contains('show')) refreshTTSVoices();
 }
 document.addEventListener("click", e => {
   const p = $("configPopup");
@@ -823,63 +830,7 @@ const remoteVoice = {
   $('voiceMicSource').value = voiceMicSource;
 })();
 
-// ── 视频通话开关 ──
-async function toggleVideoCallEnabled() {
-  const enabled = $('videoCallToggle').checked;
-  try {
-    await fetch('/api/settings/video-call', {
-      method: 'PUT',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({ enabled })
-    });
-  } catch(e) { console.warn('保存视频通话设置失败', e); }
-}
-(async function initVideoCallToggle() {
-  try {
-    const r = await fetch('/api/settings/video-call');
-    const d = await r.json();
-    $('videoCallToggle').checked = !!d.video_call_enabled;
-  } catch(e) {}
-})();
-
-// ── AI 生图开关 ──
-async function toggleImageGenEnabled() {
-  const enabled = $('imageGenToggle').checked;
-  try {
-    await fetch('/api/settings/image-gen', {
-      method: 'PUT',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({ enabled })
-    });
-  } catch(e) { console.warn('保存生图设置失败', e); }
-}
-(async function initImageGenToggle() {
-  try {
-    const r = await fetch('/api/settings/image-gen');
-    const d = await r.json();
-    $('imageGenToggle').checked = !!d.image_gen_enabled;
-  } catch(e) {}
-})();
-
-// ── CLI 工具调用开关 ──
-async function toggleSongGenEnabled() {
-  const enabled = $('songGenToggle').checked;
-  try {
-    await fetch('/api/settings/song-gen', {
-      method: 'PUT',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({ enabled })
-    });
-  } catch(e) { console.warn('保存歌曲生成设置失败', e); }
-}
-(async function initSongGenToggle() {
-  try {
-    const r = await fetch('/api/settings/song-gen');
-    const d = await r.json();
-    $('songGenToggle').checked = !!d.song_gen_enabled;
-  } catch(e) {}
-})();
-
+// ── CLI 工具调用开关（通话、生图、生歌统一由工具能力管理） ──
 async function toggleGeminiCliTools() {
   const enabled = $('geminiCliToolsToggle').checked;
   try {
@@ -936,6 +887,7 @@ function isTTSPlaybackAllowed() {
 }
 
 function stopLiveTTSQueue() {
+  window.AionTtsAudio?.stopAutoPlayback?.();
   ttsManualStop = true;
   clearTTSResumeTimer();
   ttsAudio.pause();
@@ -967,6 +919,7 @@ function shouldAcceptTTSMsg(msgId, createdAt, targetClientId) {
 }
 
 function _sendTTSState() {
+  window.AionTtsAudio?.setAutoPlaybackState?.(ttsEnabled, ttsVoiceId, ttsPlaybackActiveAt);
   if (ws && ws.readyState === WebSocket.OPEN) {
     ws.send(JSON.stringify({
       type: 'tts_state',
@@ -1028,21 +981,10 @@ async function refreshTTSVoices() {
   try {
     const data = await api("GET", "/api/tts/voices");
     const sel = $('ttsVoiceSelect');
-    if (data.voices && data.voices.length > 0) {
-      sel.innerHTML = data.voices.map(v => {
-        const name = v.customName || v.uri || 'Unknown';
-        return `<option value="${v.uri}" ${v.uri === ttsVoiceId ? 'selected' : ''}>${name}</option>`;
-      }).join('');
-      // 如果没有选中的音色，默认选第一个
-      if (!ttsVoiceId || !data.voices.find(v => v.uri === ttsVoiceId)) {
-        ttsVoiceId = data.voices[0].uri;
-        localStorage.setItem('aion_tts_voice', ttsVoiceId);
-        sel.value = ttsVoiceId;
-        _sendTTSState();
-      }
-    } else {
-      sel.innerHTML = '<option value="">无可用音色</option>';
-    }
+    ttsVoiceId = TTSVoices.populate(sel, data.voices || [], ttsVoiceId);
+    sel.title = data.error || '';
+    localStorage.setItem('aion_tts_voice', ttsVoiceId);
+    _sendTTSState();
   } catch(e) {
     console.error('刷新TTS音色失败:', e);
   }
@@ -1252,7 +1194,6 @@ function finishTTSForMsg(msgId, createdAt, targetClientId) {
 }
 
 function _cleanupFinishedTTS() {
-  let cleaned = false;
   while (ttsPlayOrder.length > 0) {
     const msgId = ttsPlayOrder[0];
     const q = ttsChunkQueues[msgId];
@@ -1262,13 +1203,12 @@ function _cleanupFinishedTTS() {
     if (q.nextPlay > maxSeq) {
       ttsPlayOrder.shift();
       delete ttsChunkQueues[msgId];
-      cleaned = true;
     } else {
       break;
     }
   }
-  // 清理后如果播放器空闲，重新触发播放流程（可能会走到"所有播完"逻辑）
-  if (cleaned && !ttsPlaying) {
+  // 收到结束通知后也要唤醒等待缺失分段的队列，让播放器跳过缺段。
+  if (!ttsPlaying) {
     playNextTTSChunk();
   }
 }
@@ -1362,29 +1302,9 @@ function _playReplayChunk(btn, token = replayToken) {
 
 
 // ── 日程管理 → 已拆分为独立页面 ──
-let _alarmQueue = [];
+const _homePopups = import('/static/home-popups.js?v=20260923').then(() => window.AionHomePopups);
 function showAlarmPopup(data) {
-  _alarmQueue.push(data);
-  if (_alarmQueue.length === 1) _showNextAlarm();
-  // 系统通知（即使标签页在后台也能弹出）
-  const body = data.origin_name
-    ? `【${data.origin_name}】设定的闹铃：${data.content || '日程提醒'}`
-    : (data.content || '日程提醒');
-  sendSystemNotification('⏰ 闹铃', body);
-}
-function _showNextAlarm() {
-  if (!_alarmQueue.length) return;
-  const data = _alarmQueue[0];
-  $("alarmContent").textContent = data.origin_name
-    ? `【${data.origin_name}】设定的闹铃：${data.content || "日程提醒"}`
-    : (data.content || "日程提醒");
-  $("alarmTime").textContent = data.trigger_at || "";
-  $("alarmOverlay").classList.add("show");
-}
-function dismissAlarm() {
-  $("alarmOverlay").classList.remove("show");
-  _alarmQueue.shift();
-  if (_alarmQueue.length) setTimeout(_showNextAlarm, 300);
+  _homePopups.then(ui => ui.handleEvent({ type: 'schedule_alarm', data }));
 }
 
 async function api(method, url, body, options = {}) {
@@ -1515,6 +1435,8 @@ function connectWS() {
 }
 
 function handleSync(msg) {
+  if (msg.type === 'generation_stopped') { _chatControl.remoteStop(msg.data); return; }
+  if (!_chatControl.accepts(msg)) return;
   const { type, data } = msg;
 
   if (type === "proactive_companionship_changed") {
@@ -1663,8 +1585,12 @@ function handleSync(msg) {
   } else if (type === "monitor_alert") {
     // 定时监控即将触发，播放提示音
     if (!data.phone_camera_native_capture) {
-      const audio = new Audio('/public/AionMonitoralart.mp3');
-      audio.play().catch(() => {});
+      if (window.AionTtsAudio && typeof window.AionTtsAudio.play === 'function') {
+        window.AionTtsAudio.play('tts-monitor-alert', '/public/AionMonitoralart.mp3');
+      } else {
+        const audio = new Audio('/public/AionMonitoralart.mp3');
+        audio.play().catch(() => {});
+      }
     }
     const body = data.origin_name
       ? `【${data.origin_name}】设定的监督：${data.content || '哨兵监控即将分析'}`
@@ -1689,8 +1615,7 @@ function handleSync(msg) {
     // AI 发起视频通话 — 定向推送到本客户端
     if (typeof videoCall !== 'undefined') videoCall.aiInitiate(data);
   } else if (type === "gift_pending") {
-    // 礼物通知
-    _showGiftPopup(data);
+    // 礼物由 Home 接收和展示；未领取礼物会在 Home 恢复时补查。
   } else if (type === "wallet_update") {
     // 钱包余额变动 → 如果钱包面板打开则刷新
     if ($('walletPanelOverlay').classList.contains('show')) openWalletPanel();
@@ -1748,6 +1673,9 @@ function messagesForDisplay(messages) {
   let pendingLegacyNotices = [];
   const list = _dedupeMessagesById(messages || []);
   const indexById = new Map(list.map((m, idx) => [m?.id, idx]));
+  const inlinePats = window.AionPat?.collectInlineNotices(list) || {
+    bySourceId: new Map(), noticeIds: new Set(),
+  };
 
   function appendPendingFor(id) {
     const pending = pendingById.get(id);
@@ -1763,6 +1691,7 @@ function messagesForDisplay(messages) {
 
   for (let idx = 0; idx < list.length; idx++) {
     const m = list[idx];
+    if (m?.id && inlinePats.noticeIds.has(String(m.id))) continue;
     const afterMsgId = systemNoticeAfterMsgId(m);
     if (afterMsgId && indexById.has(afterMsgId) && idx < indexById.get(afterMsgId)) {
       if (!pendingById.has(afterMsgId)) pendingById.set(afterMsgId, []);
@@ -1779,7 +1708,8 @@ function messagesForDisplay(messages) {
       out.push(...pendingLegacyNotices);
       pendingLegacyNotices = [];
     }
-    out.push(m);
+    const notices = m?.id ? inlinePats.bySourceId.get(String(m.id)) : null;
+    out.push(notices?.length ? {...m, _inlinePatNotices: notices} : m);
     if (m?.role === "assistant") appendPendingFor(m.id);
   }
   if (pendingLegacyNotices.length) out.push(...pendingLegacyNotices);
@@ -1825,6 +1755,7 @@ function renderConvList() {
 }
 
 function privateSystemMessageHTML(m, nextMessage = null) {
+  const pat = window.AionPat?.isPat(m);
   const loungeStatus = window.LoungeVisitUI && window.LoungeVisitUI.isStatusMessage(m);
   const afterMsgId = systemNoticeAfterMsgId(m);
   const beforeMsgId = systemNoticeBeforeMsgId(m, nextMessage);
@@ -1842,11 +1773,11 @@ function privateSystemMessageHTML(m, nextMessage = null) {
         },
       )
     : "";
-  const contentHtml = snapshotHtml || (window.SystemNoticeUI
-    ? window.SystemNoticeUI.renderSystemNoticeContent(displayContent, {escapeHtml: escHtml})
+  const contentHtml = pat ? `<span class="pat-text">${escHtml(m.content || '')}</span>` : snapshotHtml || (window.SystemNoticeUI
+    ? window.SystemNoticeUI.renderSystemNoticeContent(displayContent, {escapeHtml: escHtml, attachments: m.attachments})
     : `<span class="system-notice-text">${escHtml(displayContent)}</span>`);
   return `
-  <div class="msg-row system${loungeStatus ? ' lounge-visit-status-line' : ''}" id="m_${m.id}" data-msg-id="${m.id}" tabindex="0" onclick="this.focus()"${afterAttr}${beforeAttr}>
+  <div class="msg-row system${pat ? ' pat-notice' : ''}${loungeStatus ? ' lounge-visit-status-line' : ''}" id="m_${m.id}" data-msg-id="${m.id}" tabindex="0" onclick="this.focus()"${afterAttr}${beforeAttr}>
     <div class="system-notice">
       <span class="system-notice-marker" aria-hidden="true">&gt;</span>
       ${contentHtml}
@@ -1911,13 +1842,25 @@ function privateMessageContentItems(value, isUser = false) {
   return items;
 }
 
+function privateMessageContentItemsWithInlinePats(value, isUser, notices) {
+  if (isUser || !notices?.length || !window.AionPat?.interleaveContent) {
+    return privateMessageContentItems(value, isUser);
+  }
+  const items = [];
+  for (const part of window.AionPat.interleaveContent(value, notices)) {
+    if (part.type === 'notice') items.push({type: 'pat_notice', message: part.message});
+    else items.push(...privateMessageContentItems(part.text, isUser));
+  }
+  return items;
+}
+
 function renderPrivateMessageHTML(m) {
   const isUser = m.role === 'user';
   const isAssistant = m.role === 'assistant';
   const roleLabel = isUser ? (worldBook.user_name || '你') : (worldBook.ai_name || 'AI');
   const time = m.created_at ? fmtTime(m.created_at) : '';
   const starLabel = m.starred ? '取消星标' : '⭐ 星标';
-  const actionsHtml = `${isUser ? `<button onclick="editMsg('${m.id}');closeMsgMenus()">编辑</button>` : `<button onclick="regenerateMsg('${m.id}');closeMsgMenus()">重新生成</button>`}<button onclick="delMsg('${m.id}');closeMsgMenus()">删除</button><button onclick="copyMsg('${m.id}');closeMsgMenus()">复制</button><button onclick="toggleStar('${m.id}');closeMsgMenus()">${starLabel}</button>`;
+  const actionsHtml = `${isUser ? `<button onclick="editMsg('${m.id}');closeMsgMenus()">编辑</button>` : `<button onclick="editAiMsg('${m.id}');closeMsgMenus()">编辑</button><button onclick="regenerateMsg('${m.id}');closeMsgMenus()">重新生成</button>`}<button onclick="delMsg('${m.id}');closeMsgMenus()">删除</button><button onclick="copyMsg('${m.id}');closeMsgMenus()">复制</button><button onclick="toggleStar('${m.id}');closeMsgMenus()">${starLabel}</button>`;
   const starBadge = m.starred ? '<span class="msg-star-badge">✨</span>' : '';
   const dotsLeft = isUser ? `<button class="msg-dots" onclick="event.stopPropagation();toggleMsgMenu('${m.id}')">&#8943;</button>` : '';
   const dotsRight = !isUser ? `<button class="msg-dots" onclick="event.stopPropagation();toggleMsgMenu('${m.id}')">&#8943;</button>` : '';
@@ -1929,15 +1872,18 @@ function renderPrivateMessageHTML(m) {
   const messageAttachments = withWishFallbackAttachments(m);
   const bandVibrationHtml = renderBandVibrationNote(messageAttachments);
   const rawContent = isUser ? (m.content || '') : (m.content || '').replace(/<meta>[\s\S]*?<\/meta>/g, '').trim();
-  const displayContent = stripWishFulfillmentMarker(rawContent).trim();
+  const inlineToy = !isUser && window.SystemNoticeUI?.splitInlineToyCommands?.(rawContent);
+  const displayContent = stripWishFulfillmentMarker(inlineToy ? inlineToy.content : rawContent).trim();
   const hasVoiceAtt = messageAttachments.some(a => typeof a === 'object' && (a.type === 'voice' || a.type === 'video_clip'));
   const hasWishFulfillmentAtt = messageAttachments.some(a => typeof a === 'object' && a.type === 'wish_fulfillment');
   const hasStandaloneCard = messageAttachments.some(a => typeof a === 'object' && (a.type === 'date_summary' || a.type === 'lounge_visit_report'));
   const isEmptyMessage = !displayContent && messageAttachments.length === 0;
-  const items = privateMessageContentItems(displayContent, isUser);
-  const textHtml = items.map(item => item.type === 'monologue'
-    ? `<div class="inner-monologue-line"><div class="inner-monologue-content markdown-body">${privateMarkdownMessageHtml(item.text, isUser)}</div></div>`
-    : `<div class="${isUser ? 'msg-bubble' : 'private-ai-message-content'} markdown-body">${privateMarkdownMessageHtml(item.text, isUser)}</div>`
+  const items = privateMessageContentItemsWithInlinePats(displayContent, isUser, m._inlinePatNotices);
+  const textHtml = items.map(item => item.type === 'pat_notice'
+    ? privateSystemMessageHTML(item.message)
+    : item.type === 'monologue'
+      ? `<div class="inner-monologue-line"><div class="inner-monologue-content markdown-body">${privateMarkdownMessageHtml(item.text, isUser)}</div></div>`
+      : `<div class="${isUser ? 'msg-bubble' : 'private-ai-message-content'} markdown-body">${privateMarkdownMessageHtml(item.text, isUser)}</div>`
   ).join('');
   let contentHtml = textHtml;
   if (hasStandaloneCard) {
@@ -1950,10 +1896,11 @@ function renderPrivateMessageHTML(m) {
     contentHtml += renderAttachments(messageAttachments);
   }
   if (isEmptyMessage) contentHtml = `<div class="${isUser ? 'msg-bubble ' : 'private-ai-message-content '}empty-msg-bubble"></div>`;
+  if (inlineToy?.noticeHtml) contentHtml += `<div class="system-notice">${inlineToy.noticeHtml}</div>`;
   const avatarSrc = isUser ? '/public/UserIcon.png' : '/public/AIIcon.png';
   const ttsBtn = !isUser ? `<button class="tts-replay-btn" onclick="replayTTS('${m.id}')" title="重听语音">🔊</button>` : '';
   const roleRow = `<div class="msg-role-row">${dotsLeft}<span class="msg-role-name">${escHtml(roleLabel)}</span><span class="msg-time">${time}</span>${dotsRight}${feedbackHtml}${ttsBtn}${starBadge}<div class="msg-menu" id="menu_${m.id}">${actionsHtml}</div></div>`;
-  const avatar = `<div class="msg-avatar-col"><img class="msg-avatar" src="${avatarSrc}" alt=""></div>`;
+  const avatar = `<div class="msg-avatar-col"><img class="msg-avatar" src="${avatarSrc}" alt="" data-pat-target="${isUser ? 'user' : 'aion'}" role="button" tabindex="0" title="双击拍拍" aria-label="双击拍拍" draggable="false"></div>`;
   const header = isUser ? `${roleRow}${avatar}` : `${avatar}${roleRow}`;
   return `
   <div class="msg-row ${m.role}${isEmptyMessage ? ' empty-message' : ''}" id="m_${m.id}" data-msg-id="${m.id}" tabindex="0" onclick="MessageRowFocus.focusRowFromClick(event, this)">
@@ -1976,6 +1923,8 @@ function updatePrivateStreamingMessage(messageId, display) {
 
 function renderMessages() {
   const el = $("messages");
+  const restoreEditors = window.AIMessageEditor?.preserve(el);
+  const previousScrollTop = el.scrollTop;
 
   if (!currentConvId) {
     el.innerHTML = '<div class="empty-state" style="display:flex"><div class="icon">💬</div><div class="hint">选择或创建一个对话开始聊天</div></div>';
@@ -2082,12 +2031,14 @@ function renderMessages() {
   for (const mrMsgId of _memoryRecordMsgIds) {
     _applyMemoryHint(mrMsgId);
   }
-  scrollBottom();
+  if (restoreEditors?.()) el.scrollTop = previousScrollTop;
+  else scrollBottom();
 }
 
 function scrollBottom() {
   if (_suppressScrollBottom) return;
   const el = $("messages");
+  if (el.querySelector('.ai-text-editing')) return;
   requestAnimationFrame(() => el.scrollTop = el.scrollHeight);
 }
 
@@ -2706,6 +2657,7 @@ function playMusicOnline(songId) {
 
 // ── 对话 ──
 async function newConversation() {
+  await privateModelReady;
   const model = $("modelSelect").value;
   const today = new Date();
   const title = today.getFullYear() + '-' + String(today.getMonth()+1).padStart(2,'0') + '-' + String(today.getDate()).padStart(2,'0');
@@ -2840,36 +2792,68 @@ function renameCurrent() {
 
 // ── 发送/停止按钮切换 ──
 function handleSendBtn() {
-  if (sending) { stopGeneration(); } else { send(); }
+  if (sending || _chatControl.active || _chatControl.retryStop) { stopGeneration(); } else { send(); }
 }
 
 function _showStopBtn() {
   const btn = $("sendBtn");
   btn.disabled = false;
   btn.classList.add('stop-mode');
+  btn.title = '停止本次回复';
+  btn.setAttribute('aria-label', '停止本次回复');
   btn.innerHTML = '■';
 }
 
 function _showSendBtn() {
+  if (_chatControl.active || _chatControl.retryStop) { _showStopBtn(); return; }
   const btn = $("sendBtn");
   btn.classList.remove('stop-mode');
+  btn.title = '发送';
+  btn.setAttribute('aria-label', '发送');
   btn.innerHTML = '➤';
   btn.disabled = false;
 }
 
 function _updateSendBtnState() {
-  if (sending) return;
+  if (sending || _chatControl.active || _chatControl.retryStop) return;
   const btn = $("sendBtn");
   btn.disabled = !$("input").value.trim() && !pendingAttachments.length;
 }
 
+const _chatControl = new ChatGenerationControl({
+  surface: 'private',
+  baseUrl: id => `/api/conversations/${encodeURIComponent(id)}`,
+  onStart: () => _showStopBtn(),
+  onStop(generation) {
+    generation.messageIds.forEach(suppressTTSMsg);
+    stopLiveTTSQueue();
+    sending = false;
+    _abortController = null;
+    _stopTypingAnim();
+    streamingAiId = null;
+    currentMessages = currentMessages.filter(m => !((generation.messageIds.has(m.id) || m.id === 'temp_edit_thinking') && m.content === '...'));
+    renderMessages();
+    _showStopBtn();
+    $('sendBtn').title = '确认后台停止';
+  },
+  onFinish: () => _showSendBtn(),
+  onReconcile(generation, result) {
+    const ids = result.message_ids || [];
+    ids.forEach(suppressTTSMsg);
+    if (ttsPlayOrder.some(id => ids.includes(id))) stopLiveTTSQueue();
+    if (currentConvId !== generation.target) return;
+    (result.messages || []).forEach(upsertCurrentMessage);
+    renderMessages();
+  },
+  onError(message) {
+    if (!_chatControl.active) _showStopBtn();
+    $('sendBtn').title = message;
+    addErrorToSystemLog(message);
+  },
+});
+
 async function stopGeneration() {
-  // 1. 中断前端 fetch 连接
-  if (_abortController) { _abortController.abort(); _abortController = null; }
-  // 2. 通知后端停止生成
-  if (currentConvId) {
-    try { await fetch(`/api/conversations/${currentConvId}/abort`, { method: 'POST' }); } catch {}
-  }
+  await _chatControl.stop();
 }
 
 function _getMaxTokens() {
@@ -2881,6 +2865,7 @@ function _getMaxTokens() {
 async function send() {
   const input = $("input");
   const text = input.value.trim();
+  if (pendingAttachments.some(a => a.uploading)) { alert('图片或附件还在上传，请稍等'); return; }
   if ((!text && !pendingAttachments.length) || !currentConvId || sending) return;
 
   sending = true;
@@ -2888,6 +2873,7 @@ async function send() {
   input.value = "";
   autoResize(input);
   const attachments = pendingAttachments.map(a => a.url);
+  pendingAttachments.forEach(a => ChatImageUpload.release(a));
   pendingAttachments = [];
   renderPreview();
 
@@ -2897,16 +2883,17 @@ async function send() {
   upsertCurrentMessage(tempUserMsg);
   renderMessages();
 
-  _abortController = new AbortController();
+  const generation = _chatControl.begin(currentConvId);
+  _abortController = generation.controller;
   try {
     const contextLimit = parseInt($("contextSlider").value) || 30;
     const temperature = parseFloat($("tempSlider").value);
     const maxTokens = _getMaxTokens();
-    const res = await fetch(`/api/conversations/${currentConvId}/send`, {
+    const res = await _chatControl.fetch(generation, `/api/conversations/${currentConvId}/send`, {
       method: "POST",
       headers: {"Content-Type": "application/json"},
       body: JSON.stringify({ content: text, context_limit: contextLimit, attachments, whisper_mode: whisperMode, temperature, max_tokens: maxTokens, tts_enabled: ttsEnabled, tts_voice: ttsVoiceId, client_id: _clientId }),
-      signal: _abortController.signal
+      signal: generation.controller.signal
     });
 
     await _processSSEStream(res);
@@ -2927,14 +2914,18 @@ async function send() {
       }
     }
   } finally {
-    sending = false;
-    streamingAiId = null;
-    _abortController = null;
-    _showSendBtn();
+    if (_chatControl.isCurrent(generation)) {
+      sending = false;
+      streamingAiId = null;
+      _abortController = null;
+      _showSendBtn();
+      _chatControl.finish(generation);
+    }
   }
 }
 
 async function _processSSEStream(res) {
+    const generation = res.chatGeneration;
     const reader = res.body.getReader();
     const decoder = new TextDecoder();
     let aiMsgId = null;
@@ -2952,6 +2943,7 @@ async function _processSSEStream(res) {
         if (!line.startsWith("data: ")) continue;
         try {
           const data = JSON.parse(line.slice(6));
+          if (!_chatControl.accepts(data, generation)) continue;
           if (data.type === "start") {
             aiMsgId = data.id;
             const existing = currentMessages.find(m => m.id === aiMsgId);
@@ -2976,7 +2968,7 @@ async function _processSSEStream(res) {
             if (aiFinalAlreadyReceived) continue;
             _stopTypingAnim();
             aiContent = data.type === "replace" ? data.content : aiContent + data.content;
-            const display = aiContent.replace(/\[CAM_CHECK\]/g, '').replace(/\[POI_SEARCH:[^\]]*\]/g, '').replace(/\[MUSIC:[^\]]*\]/g, '').replace(/\[ALARM:[^\]]*\]/g, '').replace(/\[REMINDER:[^\]]*\]/g, '').replace(/\[Monitor:[^\]]*\]/g, '').replace(/\[SCHEDULE_DEL:[^\]]*\]/g, '').replace(/\[SCHEDULE_LIST\]/g, '').replace(/\[NEXT_CHAT:[^\]]*\]/gi, '').replace(/\[TOY:[^\]]*\]/g, '').replace(/\[HEART:[^\]]*\]/g, '').replace(/\[MEMORY:[^\]]*\]/g, '').replace(/\[查看动态:\d+\]/g, '').replace(/\[视频电话\]/g, '').replace(/\[SELFIE:\s*[^\]]*\]/g, '').replace(/\[DRAW:\s*[^\]]*\]/g, '').replace(/\[SONG\][\s\S]*?\[\/SONG\]/gi, '').replace(/<meta>[\s\S]*?<\/meta>/g, '').replace(/\s*<autonomy_state>[\s\S]*$/gi, '').trim();
+            const display = aiContent.replace(/\[(?:SVAKOM|ANKNI):[^\]]*(?:\]|$)/gi, '').replace(/\[CAM_CHECK\]/g, '').replace(/\[POI_SEARCH:[^\]]*\]/g, '').replace(/\[MUSIC:[^\]]*\]/g, '').replace(/\[ALARM:[^\]]*\]/g, '').replace(/\[REMINDER:[^\]]*\]/g, '').replace(/\[Monitor:[^\]]*\]/g, '').replace(/\[SCHEDULE_DEL:[^\]]*\]/g, '').replace(/\[SCHEDULE_LIST\]/g, '').replace(/\[NEXT_CHAT:[^\]]*\]/gi, '').replace(/\[TOY:[^\]]*\]/g, '').replace(/\[HEART:[^\]]*\]/g, '').replace(/\[MEMORY:[^\]]*\]/g, '').replace(/\[查看动态:\d+\]/g, '').replace(/\[视频电话\]/g, '').replace(/\[SELFIE:\s*[^\]]*\]/g, '').replace(/\[DRAW:\s*[^\]]*\]/g, '').replace(/\[SONG\][\s\S]*?\[\/SONG\]/gi, '').replace(/<meta>[\s\S]*?<\/meta>/g, '').replace(/\s*<autonomy_state>[\s\S]*$/gi, '').trim();
             const mi = currentMessages.findIndex(m => m.id === aiMsgId);
             if (mi >= 0) currentMessages[mi].content = display;
             const container = document.getElementById(`m_${aiMsgId}`);
@@ -3003,7 +2995,7 @@ async function _processSSEStream(res) {
             scrollBottom();
             if (data.cards && data.cards.length) playMusicOnline(data.cards[0].id);
           } else if (data.type === "toy_command") {
-            if (toyConnected) data.commands.forEach(c => toyExecCmd(c));
+            handleLegacyToyEvent(data);
             showToyCapsule(data.msg_id, data.commands);
           } else if (data.type === "moment_new") {
             // 朋友圈动态不在聊天界面展示
@@ -3028,6 +3020,29 @@ async function _processSSEStream(res) {
 
 // ── 消息操作 ──
 async function delMsg(id) { await api("DELETE", `/api/messages/${id}`); }
+
+function editAiMsg(id) {
+  closeMsgMenus();
+  const msg = currentMessages.find(m => m.id === id);
+  if (!msg || msg.role !== 'assistant') return;
+  if (sending || streamingAiId) { alert('请等当前回复结束，或先停止回复后再编辑'); return; }
+  const convId = currentConvId;
+  const row = document.getElementById(`m_${id}`);
+  window.AIMessageEditor.open(row, row?.querySelector('.private-message-flow'), msg.content,
+    async content => {
+      if (sending || streamingAiId) throw new Error('请先等当前回复结束再保存');
+      const result = await api('PUT', `/api/messages/${encodeURIComponent(id)}`, { content });
+      return result.message;
+    },
+    updated => {
+      if (currentConvId !== convId) return;
+      const index = currentMessages.findIndex(m => m.id === id);
+      if (index < 0) return;
+      if (updated) currentMessages[index] = updated;
+      const displayMsg = messagesForDisplay(currentMessages).find(m => m.id === id) || currentMessages[index];
+      if (row?.isConnected) row.outerHTML = renderPrivateMessageHTML(displayMsg);
+    });
+}
 
 function editMsg(id) {
   closeMsgMenus();
@@ -3077,16 +3092,17 @@ async function saveEdit(id) {
   upsertCurrentMessage({ id: tempAiId, conv_id: currentConvId, role: 'assistant', content: '...', created_at: Date.now()/1000 });
   renderMessages();
   _startTypingAnim(tempAiId);
-  _abortController = new AbortController();
+  const generation = _chatControl.begin(currentConvId);
+  _abortController = generation.controller;
   try {
     const contextLimit = parseInt($('contextSlider').value) || 30;
     const temperature = parseFloat($('tempSlider').value);
     const maxTokens = _getMaxTokens();
-    const res = await fetch(`/api/messages/${id}/edit-resend`, {
+    const res = await _chatControl.fetch(generation, `/api/messages/${id}/edit-resend`, {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({ content: newText, context_limit: contextLimit, whisper_mode: whisperMode, temperature, max_tokens: maxTokens, tts_enabled: ttsEnabled, tts_voice: ttsVoiceId, client_id: _clientId }),
-      signal: _abortController.signal
+      signal: generation.controller.signal
     });
 
     if (!res.ok) {
@@ -3117,6 +3133,7 @@ async function saveEdit(id) {
         if (!line.startsWith('data: ')) continue;
         try {
           const data = JSON.parse(line.slice(6));
+          if (!_chatControl.accepts(data, generation)) continue;
           if (data.type === 'start') {
             _stopTypingAnim();
             // 替换临时思考占位为真正的 AI 消息
@@ -3138,7 +3155,7 @@ async function saveEdit(id) {
           } else if (data.type === 'chunk' || data.type === 'replace') {
             _stopTypingAnim();
             aiContent = data.type === 'replace' ? data.content : aiContent + data.content;
-            const display = aiContent.replace(/\[CAM_CHECK\]/g, '').replace(/\[POI_SEARCH:[^\]]*\]/g, '').replace(/\[MUSIC:[^\]]*\]/g, '').replace(/\[ALARM:[^\]]*\]/g, '').replace(/\[REMINDER:[^\]]*\]/g, '').replace(/\[Monitor:[^\]]*\]/g, '').replace(/\[SCHEDULE_DEL:[^\]]*\]/g, '').replace(/\[SCHEDULE_LIST\]/g, '').replace(/\[NEXT_CHAT:[^\]]*\]/gi, '').replace(/\[TOY:[^\]]*\]/g, '').replace(/\[HEART:[^\]]*\]/g, '').replace(/\[MEMORY:[^\]]*\]/g, '').replace(/\[查看动态:\d+\]/g, '').replace(/\[视频电话\]/g, '').replace(/\[SELFIE:\s*[^\]]*\]/g, '').replace(/\[DRAW:\s*[^\]]*\]/g, '').replace(/\[SONG\][\s\S]*?\[\/SONG\]/gi, '').replace(/<meta>[\s\S]*?<\/meta>/g, '').replace(/\s*<autonomy_state>[\s\S]*$/gi, '').trim();
+            const display = aiContent.replace(/\[(?:SVAKOM|ANKNI):[^\]]*(?:\]|$)/gi, '').replace(/\[CAM_CHECK\]/g, '').replace(/\[POI_SEARCH:[^\]]*\]/g, '').replace(/\[MUSIC:[^\]]*\]/g, '').replace(/\[ALARM:[^\]]*\]/g, '').replace(/\[REMINDER:[^\]]*\]/g, '').replace(/\[Monitor:[^\]]*\]/g, '').replace(/\[SCHEDULE_DEL:[^\]]*\]/g, '').replace(/\[SCHEDULE_LIST\]/g, '').replace(/\[NEXT_CHAT:[^\]]*\]/gi, '').replace(/\[TOY:[^\]]*\]/g, '').replace(/\[HEART:[^\]]*\]/g, '').replace(/\[MEMORY:[^\]]*\]/g, '').replace(/\[查看动态:\d+\]/g, '').replace(/\[视频电话\]/g, '').replace(/\[SELFIE:\s*[^\]]*\]/g, '').replace(/\[DRAW:\s*[^\]]*\]/g, '').replace(/\[SONG\][\s\S]*?\[\/SONG\]/gi, '').replace(/<meta>[\s\S]*?<\/meta>/g, '').replace(/\s*<autonomy_state>[\s\S]*$/gi, '').trim();
             const mi = currentMessages.findIndex(m => m.id === aiMsgId);
             if (mi >= 0) currentMessages[mi].content = display;
             const container = document.getElementById(`m_${aiMsgId}`);
@@ -3165,7 +3182,7 @@ async function saveEdit(id) {
             scrollBottom();
             if (data.cards && data.cards.length) playMusicOnline(data.cards[0].id);
           } else if (data.type === 'toy_command') {
-            if (toyConnected) data.commands.forEach(c => toyExecCmd(c));
+            handleLegacyToyEvent(data);
             showToyCapsule(data.msg_id, data.commands);
           } else if (data.type === 'moment_new') {
             // 朋友圈动态不在聊天界面展示
@@ -3203,10 +3220,13 @@ async function saveEdit(id) {
       renderMessages();
     }
   } finally {
-    sending = false;
-    streamingAiId = null;
-    _abortController = null;
-    _showSendBtn();
+    if (_chatControl.isCurrent(generation)) {
+      sending = false;
+      streamingAiId = null;
+      _abortController = null;
+      _showSendBtn();
+      _chatControl.finish(generation);
+    }
   }
 }
 
@@ -3224,15 +3244,16 @@ async function regenerateMsg(aiMsgId) {
   sending = true;
   _showStopBtn();
 
-  _abortController = new AbortController();
+  const generation = _chatControl.begin(currentConvId);
+  _abortController = generation.controller;
   try {
     const cl = parseInt($("contextSlider").value) || 30;
     const temperature = parseFloat($("tempSlider").value);
     const maxTokens = _getMaxTokens();
     const mtParam = maxTokens ? `&max_tokens=${maxTokens}` : '';
-    const res = await fetch(`/api/conversations/${currentConvId}/regenerate?context_limit=${cl}&whisper_mode=${whisperMode}&temperature=${temperature}${mtParam}&tts_enabled=${ttsEnabled}&tts_voice=${encodeURIComponent(ttsVoiceId)}`, {
+    const res = await _chatControl.fetch(generation, `/api/conversations/${currentConvId}/regenerate?context_limit=${cl}&whisper_mode=${whisperMode}&temperature=${temperature}${mtParam}&tts_enabled=${ttsEnabled}&tts_voice=${encodeURIComponent(ttsVoiceId)}`, {
       method: "POST", headers: {"Content-Type": "application/json"},
-      signal: _abortController.signal
+      signal: generation.controller.signal
     });
     const reader = res.body.getReader();
     const decoder = new TextDecoder();
@@ -3248,6 +3269,7 @@ async function regenerateMsg(aiMsgId) {
         if (!line.startsWith("data: ")) continue;
         try {
           const d = JSON.parse(line.slice(6));
+          if (!_chatControl.accepts(d, generation)) continue;
           if (d.type === "start") {
             newId = d.id;
             streamingAiId = newId;
@@ -3263,7 +3285,7 @@ async function regenerateMsg(aiMsgId) {
           } else if (d.type === "chunk" || d.type === "replace") {
             _stopTypingAnim();
             aiContent = d.type === "replace" ? d.content : aiContent + d.content;
-            const display = aiContent.replace(/\[CAM_CHECK\]/g, '').replace(/\[POI_SEARCH:[^\]]*\]/g, '').replace(/\[MUSIC:[^\]]*\]/g, '').replace(/\[ALARM:[^\]]*\]/g, '').replace(/\[REMINDER:[^\]]*\]/g, '').replace(/\[Monitor:[^\]]*\]/g, '').replace(/\[SCHEDULE_DEL:[^\]]*\]/g, '').replace(/\[SCHEDULE_LIST\]/g, '').replace(/\[NEXT_CHAT:[^\]]*\]/gi, '').replace(/\[TOY:[^\]]*\]/g, '').replace(/\[HEART:[^\]]*\]/g, '').replace(/\[MEMORY:[^\]]*\]/g, '').replace(/\[查看动态:\d+\]/g, '').replace(/\[视频电话\]/g, '').replace(/\[SELFIE:\s*[^\]]*\]/g, '').replace(/\[DRAW:\s*[^\]]*\]/g, '').replace(/\[SONG\][\s\S]*?\[\/SONG\]/gi, '').replace(/<meta>[\s\S]*?<\/meta>/g, '').replace(/\s*<autonomy_state>[\s\S]*$/gi, '').trim();
+            const display = aiContent.replace(/\[(?:SVAKOM|ANKNI):[^\]]*(?:\]|$)/gi, '').replace(/\[CAM_CHECK\]/g, '').replace(/\[POI_SEARCH:[^\]]*\]/g, '').replace(/\[MUSIC:[^\]]*\]/g, '').replace(/\[ALARM:[^\]]*\]/g, '').replace(/\[REMINDER:[^\]]*\]/g, '').replace(/\[Monitor:[^\]]*\]/g, '').replace(/\[SCHEDULE_DEL:[^\]]*\]/g, '').replace(/\[SCHEDULE_LIST\]/g, '').replace(/\[NEXT_CHAT:[^\]]*\]/gi, '').replace(/\[TOY:[^\]]*\]/g, '').replace(/\[HEART:[^\]]*\]/g, '').replace(/\[MEMORY:[^\]]*\]/g, '').replace(/\[查看动态:\d+\]/g, '').replace(/\[视频电话\]/g, '').replace(/\[SELFIE:\s*[^\]]*\]/g, '').replace(/\[DRAW:\s*[^\]]*\]/g, '').replace(/\[SONG\][\s\S]*?\[\/SONG\]/gi, '').replace(/<meta>[\s\S]*?<\/meta>/g, '').replace(/\s*<autonomy_state>[\s\S]*$/gi, '').trim();
             const mi = currentMessages.findIndex(m => m.id === newId);
             if (mi >= 0) currentMessages[mi].content = display;
             updatePrivateStreamingMessage(newId, display);
@@ -3287,7 +3309,7 @@ async function regenerateMsg(aiMsgId) {
             scrollBottom();
             if (d.cards && d.cards.length) playMusicOnline(d.cards[0].id);
           } else if (d.type === "toy_command") {
-            if (toyConnected) d.commands.forEach(c => toyExecCmd(c));
+            handleLegacyToyEvent(d);
             showToyCapsule(d.msg_id, d.commands);
           } else if (d.type === "moment_new") {
             // 朋友圈动态不在聊天界面展示
@@ -3317,9 +3339,12 @@ async function regenerateMsg(aiMsgId) {
       addErrorToSystemLog(`重新生成失败: ${err.message || err}`, $("modelSelect")?.value);
     }
   } finally {
-    sending = false;
-    _abortController = null;
-    _showSendBtn();
+    if (_chatControl.isCurrent(generation)) {
+      sending = false;
+      _abortController = null;
+      _showSendBtn();
+      _chatControl.finish(generation);
+    }
   }
 }
 
@@ -3397,8 +3422,12 @@ function handleCamCheck(convId, modelKey, msgId) {
   // 保底30秒安全超时：防止AI无响应时提示一直卡着
   camCheckSafetyTimer = setTimeout(() => dismissCamCheckIndicator(), 30000);
 
-  const audio = new Audio('/public/AionMonitoralart.mp3');
-  audio.play().catch(() => {});
+  if (window.AionTtsAudio && typeof window.AionTtsAudio.play === 'function') {
+    window.AionTtsAudio.play('tts-monitor-alert', '/public/AionMonitoralart.mp3');
+  } else {
+    const audio = new Audio('/public/AionMonitoralart.mp3');
+    audio.play().catch(() => {});
+  }
   // 监控查看由服务端直接触发，前端只负责 UI 显示
 }
 
@@ -3494,7 +3523,7 @@ let imageLongPressState = null;
 let imageLongPressSuppressClickUntil = 0;
 
 function imageInteractionAttrs() {
-  return 'onclick="return openImageFromElement(event, this)" oncontextmenu="showImageSaveMenu(this.src); return false;" onpointerdown="startImageLongPress(event, this.src)" onpointermove="moveImageLongPress(event)" onpointerup="cancelImageLongPress()" onpointerleave="cancelImageLongPress()" onpointercancel="cancelImageLongPress()" draggable="false"';
+  return 'onclick="return openImageFromElement(event, this)" oncontextmenu="showImageSaveMenu(ChatImagePreview.original(this)); return false;" onpointerdown="startImageLongPress(event, ChatImagePreview.original(this))" onpointermove="moveImageLongPress(event)" onpointerup="cancelImageLongPress()" onpointerleave="cancelImageLongPress()" onpointercancel="cancelImageLongPress()" draggable="false"';
 }
 
 function bindImageSaveOnly(img, clickHandler) {
@@ -3526,7 +3555,7 @@ function openImageFromElement(event, img) {
     if (event) event.preventDefault();
     return false;
   }
-  openImageViewer(img.src);
+  openImageViewer(ChatImagePreview.original(img));
   return false;
 }
 
@@ -4248,7 +4277,7 @@ function renderAttachments(atts) {
       const url = typeof item === 'string' ? item : (item && item.url ? item.url : '');
       if (/\.(mp4|webm|mov)$/i.test(url)) mediaHtml += `<video src="${escHtml(url)}" controls preload="metadata"></video>`;
       else if (/\.(mp3|wav|m4a|aac|ogg)$/i.test(url)) mediaHtml += `<audio src="${escHtml(url)}" controls preload="metadata"></audio>`;
-      else if (url) mediaHtml += `<img src="${escHtml(url)}" ${imageInteractionAttrs()}>`;
+      else if (url) mediaHtml += `<img ${ChatImagePreview.attributes(url)} ${imageInteractionAttrs()}>`;
     }
   });
   let html = '';
@@ -4260,16 +4289,12 @@ function renderAttachments(atts) {
 }
 
 async function handleFileSelect(input) {
-  for (const file of input.files) {
-    const fd = new FormData();
-    fd.append('file', file);
-    const res = await fetch('/api/upload', {method:'POST', body: fd});
-    const data = await res.json();
-    if (data.error) { alert(data.error); continue; }
-    pendingAttachments.push(data);
-  }
+  const files = Array.from(input.files);
   input.value = '';
-  renderPreview();
+  for (const file of files) {
+    try { await ChatImageUpload.add('/api/upload', file, pendingAttachments, renderPreview); }
+    catch (err) { alert(err.message); }
+  }
 }
 
 // 粘贴图片到输入框
@@ -4278,18 +4303,11 @@ document.addEventListener('DOMContentLoaded', () => {
   if (input) input.addEventListener('paste', async (e) => {
     const items = e.clipboardData && e.clipboardData.items;
     if (!items) return;
-    for (const item of items) {
-      if (!item.type.startsWith('image/')) continue;
-      e.preventDefault();
-      const file = item.getAsFile();
-      if (!file) continue;
-      const fd = new FormData();
-      fd.append('file', file);
-      const res = await fetch('/api/upload', {method:'POST', body: fd});
-      const data = await res.json();
-      if (data.error) { alert(data.error); continue; }
-      pendingAttachments.push(data);
-      renderPreview();
+    const files = Array.from(items).filter(item => item.type.startsWith('image/')).map(item => item.getAsFile()).filter(Boolean);
+    if (files.length) e.preventDefault();
+    for (const file of files) {
+      try { await ChatImageUpload.add('/api/upload', file, pendingAttachments, renderPreview); }
+      catch (err) { alert(err.message); }
     }
   });
 });
@@ -4300,12 +4318,15 @@ function renderPreview() {
   area.className = 'preview-area has-files';
   area.innerHTML = pendingAttachments.map((a, i) => {
     const isVid = a.type && a.type.startsWith('video/');
-    const media = isVid ? `<video src="${a.url}" muted></video>` : `<img src="${a.url}">`;
-    return `<div class="preview-item">${media}<button class="preview-remove" onclick="removeAttachment(${i})">✕</button></div>`;
+    const src = escHtml(a.previewUrl || a.url || '');
+    const media = isVid ? `<video src="${src}" muted></video>` : `<img src="${src}">`;
+    const status = a.uploading ? `<span style="position:absolute;bottom:0;left:0;right:0;background:#000a;color:white;font-size:11px;text-align:center" role="status">${escHtml(a.status)}</span>` : '';
+    return `<div class="preview-item">${media}${status}<button class="preview-remove" onclick="removeAttachment(${i})">✕</button></div>`;
   }).join('');
 }
 
 function removeAttachment(i) {
+  ChatImageUpload.release(pendingAttachments[i]);
   pendingAttachments.splice(i, 1);
   renderPreview();
 }
@@ -4470,13 +4491,9 @@ async function capturePhoto() {
   // 转 blob 上传
   const resp = await fetch(dataUrl);
   const blob = await resp.blob();
-  const fd = new FormData();
-  fd.append('file', blob, 'photo_' + Date.now() + '.jpg');
-  const res = await fetch('/api/upload', { method: 'POST', body: fd });
-  const data = await res.json();
-  if (data.error) { alert(data.error); return; }
-  pendingAttachments.push(data);
-  renderPreview();
+  const photo = new File([blob], 'photo_' + Date.now() + '.jpg', { type: blob.type });
+  try { await ChatImageUpload.add('/api/upload', photo, pendingAttachments, renderPreview); }
+  catch (err) { alert(err.message); }
 }
 
 // ── 语音消息播放 ──
@@ -4795,26 +4812,30 @@ async function _voiceSendMessage(audioBlob, duration) {
   renderMessages();
   scrollBottom();
 
-  _abortController = new AbortController();
+  const generation = _chatControl.begin(currentConvId);
+  _abortController = generation.controller;
   try {
     const contextLimit = parseInt($("contextSlider").value) || 30;
     const temperature = parseFloat($("tempSlider").value);
     const maxTokens = _getMaxTokens();
-    const res = await fetch(`/api/conversations/${currentConvId}/send`, {
+    const res = await _chatControl.fetch(generation, `/api/conversations/${currentConvId}/send`, {
       method: "POST",
       headers: {"Content-Type": "application/json"},
       body: JSON.stringify({ content: "", context_limit: contextLimit, attachments, whisper_mode: whisperMode, temperature, max_tokens: maxTokens, tts_enabled: ttsEnabled, tts_voice: ttsVoiceId, client_id: _clientId }),
-      signal: _abortController.signal
+      signal: generation.controller.signal
     });
     // 复用和 send() 完全相同的 SSE 处理逻辑
     await _processSSEStream(res);
   } catch (err) {
     if (err.name !== 'AbortError') console.error('[VoiceMsg] Send error:', err);
   } finally {
-    sending = false;
-    streamingAiId = null;
-    _abortController = null;
-    _showSendBtn();
+    if (_chatControl.isCurrent(generation)) {
+      sending = false;
+      streamingAiId = null;
+      _abortController = null;
+      _showSendBtn();
+      _chatControl.finish(generation);
+    }
   }
 }
 
@@ -4972,11 +4993,60 @@ if (_bleCh) _bleCh.onmessage = function(ev) {
   else toyLog('已断开（来自聊天室）', 'wl-err');
 };
 
+window.hasDedicatedToyController = function() {
+  return persistentSubPageFrames.has('/toys/sosexy');
+};
+const legacyToyEvents = new Set();
+async function handleLegacyToyEvent(data) {
+  if (!toyConnected || window.hasDedicatedToyController() || !data?.epoch || legacyToyEvents.has(data.msg_id)) return;
+  legacyToyEvents.add(data.msg_id);
+  if (legacyToyEvents.size > 512) legacyToyEvents.delete(legacyToyEvents.values().next().value);
+  try {
+    const response = await fetch('/api/toys/selection', {cache:'no-store'});
+    if (!response.ok) return;
+    const selected = await response.json();
+    if (toyConnected && selected.active === 'sosexy' && selected.epoch === data.epoch) data.commands.forEach(c => toyExecCmd(c));
+  } catch(error) { console.warn('旧玩具控制状态同步失败', error); }
+}
+window.stopAllToyControllers = async function() {
+  for (const [path, frame] of persistentSubPageFrames) {
+    if (path.startsWith('/toys/')) await frame.contentWindow?.stopAndDisconnectToy?.();
+  }
+  if (toyConnected) { toyStopAll(); window.AionBle?.disconnect(); toyConnected=false; toyUpdateUI(); }
+};
+
+function forwardSvakomNativeCallback(method, ...args) {
+  // Android evaluates callbacks in the top-level /chat shell, not its iframe.
+  let receiver;
+  try {
+    const profile = window.AionBle?.getProfile?.() || 'svakom';
+    const path = '/toys/' + profile;
+    const frame = persistentSubPageFrames.get(path) || activeSubPageFrame;
+    const child = frame?.contentWindow;
+    if (!child || child.location.origin !== location.origin
+        || child.location.pathname !== path) return false;
+    receiver = child.toyNativeBle;
+  } catch (error) { return false; }
+  if (typeof receiver?.[method] !== 'function') return false;
+  receiver[method](...args);
+  return true;
+}
 window.toyNativeBle = {
-  onConnected()      { toyConnected = true; toyUpdateUI(); toyLog('已连接 ♡', 'wl-sys'); _bleNotify(true); },
-  onDisconnected()   { toyConnected = false; toyUpdateUI(); toyLog('断开', 'wl-err'); _bleNotify(false); },
-  onError(msg)       { toyLog(msg, 'wl-err'); },
-  onLog(msg)         { toyLog(msg, 'wl-sys'); }
+  onConnected(profile, name) {
+    if (forwardSvakomNativeCallback('onConnected', profile, name)) return;
+    toyConnected = true; toyUpdateUI(); toyLog('已连接 ♡', 'wl-sys'); _bleNotify(true);
+  },
+  onDisconnected() {
+    if (forwardSvakomNativeCallback('onDisconnected')) return;
+    toyConnected = false; toyUpdateUI(); toyLog('断开', 'wl-err'); _bleNotify(false);
+  },
+  onError(msg) {
+    if (!forwardSvakomNativeCallback('onError', msg)) toyLog(msg, 'wl-err');
+  },
+  onLog(msg) {
+    if (!forwardSvakomNativeCallback('onLog', msg)) toyLog(msg, 'wl-sys');
+  },
+  onNativeAction(action) { forwardSvakomNativeCallback('onNativeAction', action); }
 };
 
 const TOY_MOTORS = [
@@ -5024,6 +5094,7 @@ function toySleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 async function toySendData2(hexCmd) {
   // 原生 BLE 桥接（Android APK）
   if (window.AionBle && window.AionBle.isConnected()) {
+    if (window.AionBle.getProfile?.() !== 'sosexy') return;
     toyLog('→ ' + hexCmd, 'wl-send');
     window.AionBle.sendData(hexCmd);
     return;
@@ -5225,171 +5296,6 @@ function onWhisperModeChange() {
   toyLog(whisperMode ? '🔮 密语模式已开启' : '🔮 密语模式已关闭', 'wl-sys');
 }
 
-// ── 礼物弹窗系统 ──
-let _giftQueue = [];
-let _giftShowing = false;
-const _GIFT_KNOWN_KEY = 'aion_gift_known_ids';
-let _giftKnownIds = _readGiftKnownIds();
-
-function _readGiftKnownIds() {
-  try {
-    return new Set(JSON.parse(localStorage.getItem(_GIFT_KNOWN_KEY) || '[]'));
-  } catch(e) {
-    return new Set();
-  }
-}
-
-function _isGiftKnown(giftId) {
-  if (!giftId) return true;
-  if (_giftKnownIds.has(giftId)) return true;
-  _giftKnownIds = _readGiftKnownIds();
-  return _giftKnownIds.has(giftId);
-}
-
-function _rememberGiftSeen(giftId) {
-  if (!giftId) return;
-  _giftKnownIds = _readGiftKnownIds();
-  _giftKnownIds.add(giftId);
-  localStorage.setItem(_GIFT_KNOWN_KEY, JSON.stringify([..._giftKnownIds].slice(-200)));
-}
-
-function _dropKnownGiftPopups() {
-  _giftKnownIds = _readGiftKnownIds();
-  const current = _giftQueue[0];
-  _giftQueue = _giftQueue.filter(g => g && !_giftKnownIds.has(g.id));
-  if (current && _giftKnownIds.has(current.id)) {
-    const overlay = document.getElementById('giftOverlay');
-    if (overlay) overlay.remove();
-    _giftShowing = false;
-    _presentNextGift();
-  }
-}
-
-window.addEventListener('storage', (e) => {
-  if (e.key === _GIFT_KNOWN_KEY) _dropKnownGiftPopups();
-});
-
-// 页面加载时检查未领取的礼物
-(async function checkPendingGifts() {
-  try {
-    const res = await fetch('/api/gift/pending');
-    const data = await res.json();
-    if (data.ok && data.gifts && data.gifts.length > 0) {
-      data.gifts.forEach(g => _showGiftPopup(g));
-    }
-  } catch(e) {}
-})();
-
-function _showGiftPopup(gift) {
-  if (!gift || !gift.id || _isGiftKnown(gift.id) || _giftQueue.some(g => g.id === gift.id)) return;
-  _giftQueue.push(gift);
-  if (!_giftShowing) _presentNextGift();
-}
-function _presentNextGift() {
-  if (!_giftQueue.length) { _giftShowing = false; return; }
-  _giftShowing = true;
-  const gift = _giftQueue[0];
-  const old = document.getElementById('giftOverlay');
-  if (old) old.remove();
-  const overlay = document.createElement('div');
-  overlay.id = 'giftOverlay';
-  overlay.className = 'gift-overlay';
-  overlay.innerHTML = `
-    <div class="gift-scene" id="giftScene">
-      <div class="gift-box-wrap" id="giftBoxWrap" onclick="_openGiftBox()">
-        <svg class="gift-box-svg" viewBox="0 0 200 200" width="180" height="180">
-          <rect class="gift-body" x="30" y="100" width="140" height="90" rx="8" fill="#ff8359" stroke="#e0693f" stroke-width="2"/>
-          <rect x="90" y="100" width="20" height="90" rx="2" fill="#ffcba4"/>
-          <g class="gift-lid" id="giftLid">
-            <rect x="22" y="80" width="156" height="28" rx="6" fill="#ff6b3d" stroke="#e0693f" stroke-width="2"/>
-            <rect x="90" y="80" width="20" height="28" rx="2" fill="#ffcba4"/>
-            <ellipse cx="100" cy="76" rx="24" ry="14" fill="#ffcba4" stroke="#e0693f" stroke-width="1.5"/>
-            <ellipse cx="100" cy="76" rx="6" ry="6" fill="#ff6b3d"/>
-          </g>
-          <text x="50" y="140" font-size="16" fill="#ffcba4" opacity="0.7">✦</text>
-          <text x="135" y="155" font-size="12" fill="#ffcba4" opacity="0.7">✦</text>
-          <text x="65" y="170" font-size="10" fill="#ffcba4" opacity="0.5">✦</text>
-        </svg>
-        <div class="gift-tap-hint">点击打开</div>
-      </div>
-      <div class="gift-reveal" id="giftReveal" style="display:none">
-        <div class="confetti-container" id="confettiContainer"></div>
-        <div class="gift-image-wrap" id="giftImageWrap" onclick="_showGiftMessage()">
-          <img class="gift-image" src="/uploads/${gift.image_path}" alt="礼物" />
-        </div>
-        <div class="gift-message-wrap" id="giftMessageWrap" style="display:none">
-          <p class="gift-message-from" style="text-align:center;opacity:0.7;font-size:0.85em;margin-bottom:4px">—— from ${gift.sender === 'connor' ? (chatroomConfig.connor_name || '第二AI') : ((worldBook && worldBook.ai_name) || 'AI')} ——</p>
-          <p class="gift-message-text">${escHtml(gift.message)}</p>
-        </div>
-        <button class="gift-receive-btn" id="giftReceiveBtn" style="display:none" onclick="_receiveGift('${gift.id}')">💝 收下礼物</button>
-      </div>
-    </div>`;
-  document.body.appendChild(overlay);
-  requestAnimationFrame(() => overlay.classList.add('show'));
-}
-function _openGiftBox() {
-  const lid = document.getElementById('giftLid');
-  const wrap = document.getElementById('giftBoxWrap');
-  const reveal = document.getElementById('giftReveal');
-  if (!lid || !wrap || !reveal) return;
-  const gift = _giftQueue[0];
-  if (gift?.id) {
-    _rememberGiftSeen(gift.id);
-    fetch(`/api/gift/${gift.id}/receive`, { method: 'POST' }).catch(() => {});
-  }
-  // 播放开礼物音效
-  new Audio('/public/打开礼物.mp3').play().catch(() => {});
-  lid.classList.add('lid-open');
-  wrap.classList.add('box-opening');
-  setTimeout(() => {
-    wrap.style.display = 'none';
-    reveal.style.display = 'flex';
-    _spawnConfetti();
-    const imgWrap = document.getElementById('giftImageWrap');
-    setTimeout(() => imgWrap.classList.add('show'), 100);
-  }, 600);
-}
-function _spawnConfetti() {
-  const container = document.getElementById('confettiContainer');
-  if (!container) return;
-  const colors = ['#ff8359','#ffcba4','#ff6b9d','#ffd700','#7ecbff','#a8e6cf','#ff9a9e','#fad0c4','#fbc2eb','#a18cd1'];
-  const shapes = ['confetti-rect','confetti-circle','confetti-ribbon'];
-  for (let i = 0; i < 60; i++) {
-    const el = document.createElement('div');
-    el.className = `confetti-piece ${shapes[Math.floor(Math.random()*shapes.length)]}`;
-    el.style.setProperty('--x', (Math.random()*200-100)+'px');
-    el.style.setProperty('--y', -(Math.random()*300+200)+'px');
-    el.style.setProperty('--r', (Math.random()*720-360)+'deg');
-    el.style.setProperty('--delay', (Math.random()*0.3)+'s');
-    el.style.setProperty('--duration', (Math.random()*1+1.2)+'s');
-    el.style.backgroundColor = colors[Math.floor(Math.random()*colors.length)];
-    el.style.left = '50%'; el.style.top = '40%';
-    container.appendChild(el);
-  }
-  setTimeout(() => container.innerHTML = '', 3000);
-}
-function _showGiftMessage() {
-  const msgWrap = document.getElementById('giftMessageWrap');
-  const btn = document.getElementById('giftReceiveBtn');
-  if (msgWrap && msgWrap.style.display === 'none') {
-    msgWrap.style.display = 'block';
-    setTimeout(() => msgWrap.classList.add('show'), 50);
-    if (btn) { btn.style.display = 'inline-block'; setTimeout(() => btn.classList.add('show'), 200); }
-  }
-}
-async function _receiveGift(giftId) {
-  _rememberGiftSeen(giftId);
-  try { await fetch(`/api/gift/${giftId}/receive`, {method:'POST'}); } catch(e) {}
-  const scene = document.getElementById('giftScene');
-  if (scene) scene.classList.add('fly-away');
-  setTimeout(() => {
-    const overlay = document.getElementById('giftOverlay');
-    if (overlay) overlay.remove();
-    _giftQueue.shift();
-    _presentNextGift();
-  }, 800);
-}
-
 // URL 参数检查：从主页点击密语时刻跳转
 (function checkWhisperParam() {
   const params = new URLSearchParams(location.search);
@@ -5523,10 +5429,13 @@ function subPagePath(url) {
 function shouldNavigatePersistentSubPage(frame, url) {
   try {
     const requested = new URL(url, location.origin);
+    if (frame.dataset.navigationFailed === '1') return true;
     if (frame.dataset.startupFrame === '1' && frame.src === requested.href) {
       delete frame.dataset.startupFrame;
       return false;
     }
+    // Reopening a page whose first request is still pending must not restart it.
+    if (frame.dataset.navigationPending === '1' && frame.src === requested.href) return false;
     // Plain app launches keep the preserved page state. Explicit route params
     // (for example, a global-search message anchor) must navigate the frame.
     let current;
@@ -5547,7 +5456,8 @@ function shouldNavigatePersistentSubPage(frame, url) {
 
 function isPersistentSubPage(url) {
   const path = subPagePath(url);
-  return path === '/' || path === '/chatroom' || path === '/health' || path === '/music-station';
+  return path === '/' || path === '/chatroom' || path === '/health' || path === '/music-station'
+    || ['/toys/svakom','/toys/ankni','/toys/sosexy'].includes(path) || path === '/memory' || path === '/family-dynamics';
 }
 
 function syncHealthRingPageVisibility() {
@@ -5566,9 +5476,11 @@ function syncHealthRingPageVisibility() {
 
 function attachSubPageFrameLoad(frame) {
   frame.addEventListener('load', () => {
+    try { if (frame.contentWindow.location.href === 'about:blank') return; } catch (_) {}
+    notifySubPageLifecycle(frame, frame === activeSubPageFrame);
     if (frame !== activeSubPageFrame || !frame.src || frame.src === 'about:blank') return;
-    notifySubPageLifecycle(frame, true);
     requestAnimationFrame(() => {
+      if (frame !== activeSubPageFrame) return;
       try { syncSubPageMode(frame.contentWindow.location.href); }
       catch(e) { syncSubPageMode(frame.src); }
       syncSubPageChromeFromFrame(frame);
@@ -5576,16 +5488,30 @@ function attachSubPageFrameLoad(frame) {
   });
 }
 
+function replaceSubPageFrame(frame) {
+  notifySubPageLifecycle(frame, false);
+  const replacement = frame.cloneNode(false);
+  replacement.removeAttribute('src');
+  replacement.style.visibility = 'hidden';
+  delete replacement.dataset.navigationReady;
+  delete replacement.dataset.navigationFailed;
+  delete replacement.dataset.startupFrame;
+  frame.replaceWith(replacement);
+  attachSubPageFrameLoad(replacement);
+  return replacement;
+}
+
 function getSubPageFrame(url) {
   const path = subPagePath(url);
   if (!isPersistentSubPage(path)) {
     // 相册的原图下载需要单独允许；不改变其他子页面的沙箱权限。
-    if (path === '/album') transientSubPageFrame.sandbox.add('allow-downloads');
+    if (path === '/album' || path === '/theater') transientSubPageFrame.sandbox.add('allow-downloads');
     else transientSubPageFrame.sandbox.remove('allow-downloads');
     if (transientSubPageFrame.dataset.startupFrame === '1'
         && transientSubPageFrame.src === new URL(url, location.origin).href) {
       delete transientSubPageFrame.dataset.startupFrame;
     } else {
+      transientSubPageFrame = replaceSubPageFrame(transientSubPageFrame);
       transientSubPageFrame.dataset.pendingSrc = url;
     }
     return transientSubPageFrame;
@@ -5595,13 +5521,16 @@ function getSubPageFrame(url) {
     frame = document.createElement('iframe');
     frame.className = 'sub-page-frame';
     frame.setAttribute('sandbox', 'allow-same-origin allow-scripts allow-forms allow-popups allow-modals');
-    frame.setAttribute('allow', 'autoplay');
+    if (path === '/theater') frame.sandbox.add('allow-downloads');
+    frame.setAttribute('allow', path.startsWith('/toys/') ? 'autoplay; bluetooth' : 'autoplay');
     frame.dataset.persistentPath = path;
     attachSubPageFrameLoad(frame);
     $('subPageFrames').appendChild(frame);
     persistentSubPageFrames.set(path, frame);
     frame.dataset.pendingSrc = url;
   } else if (shouldNavigatePersistentSubPage(frame, url)) {
+    frame = replaceSubPageFrame(frame);
+    persistentSubPageFrames.set(path, frame);
     frame.dataset.pendingSrc = url;
   }
   return frame;
@@ -5621,17 +5550,52 @@ if (initialDesktopFrame) {
 }
 attachSubPageFrameLoad(transientSubPageFrame);
 
+function rememberToyReturnPage(url) {
+  if (!/^\/(?:toys(?:\/|$)|whisper$)/.test(subPagePath(url))) return;
+  if (currentSubPage && /^\/(?:toys(?:\/|$)|whisper$)/.test(subPagePath(currentSubPage))) return;
+  const startupReturn = !window.__toyReturnPage && new URLSearchParams(location.search).get('toyReturn');
+  window.__toyReturnPage = currentSubPage || startupReturn || '/chat';
+}
+
+function returnFromToyControls() {
+  const requested = window.__toyReturnPage || new URLSearchParams(location.search).get('toyReturn') || '/';
+  let target = '/';
+  try {
+    const url = new URL(requested, location.origin);
+    if (url.origin === location.origin && ['/', '/chat', '/chatroom'].includes(url.pathname)) {
+      target = url.pathname + url.search;
+    }
+  } catch (_) {}
+  // Reuse the retained chat and toy frames; going back must not disconnect BLE.
+  if (subPagePath(target) === '/chat') closeSubPage();
+  else openSubPage(target);
+}
+
+function closeSubPageFromHeader() {
+  if (currentSubPage && /^\/(?:toys(?:\/|$)|whisper$)/.test(subPagePath(currentSubPage))) {
+    returnFromToyControls();
+  } else closeSubPage();
+}
+
 function openSubPage(url) {
+  rememberToyReturnPage(url);
   closeSidebar();
   syncSubPageMode(url);
   const frame = getSubPageFrame(url);
   if (activeSubPageFrame && activeSubPageFrame !== frame) {
-    notifySubPageLifecycle(activeSubPageFrame, false);
+    if (activeSubPageFrame === transientSubPageFrame) {
+      // Dispose of the old document on back/home, not on the next launch.
+      // WebView must not keep its rendered surface while the next app downloads.
+      transientSubPageFrame = replaceSubPageFrame(transientSubPageFrame);
+    } else {
+      notifySubPageLifecycle(activeSubPageFrame, false);
+    }
   }
   document.querySelectorAll('.sub-page-frame').forEach(item => {
     item.style.display = item === frame ? 'block' : 'none';
   });
   activeSubPageFrame = frame;
+  window.AionSubPageNavigation.show(frame);
   if (frame.dataset.pendingSrc) {
     const pendingSrc = frame.dataset.pendingSrc;
     delete frame.dataset.pendingSrc;
@@ -5653,8 +5617,10 @@ function closeSubPage(skipReload = false) {
   ov.classList.remove('show');
   ov.classList.remove('home-subpage');
   ov.classList.remove('immersive-subpage');
+  window.AionSubPageNavigation.hide();
   notifySubPageLifecycle(activeSubPageFrame, false);
   if (activeSubPageFrame === transientSubPageFrame) {
+    delete transientSubPageFrame.dataset.navigationReady;
     transientSubPageFrame.src = 'about:blank';
   }
   if (activeSubPageFrame) activeSubPageFrame.style.display = 'none';
@@ -5686,12 +5652,19 @@ function handleNativeBack() {
       // 在 Home → 弹对话框
       return 'dialog';
     }
+    if (/^\/(?:toys(?:\/|$)|whisper$)/.test(path)) {
+      returnFromToyControls();
+      return 'handled';
+    }
     // 在其他功能页 → 回到 Home
     if (path === '/taobao') {
       try { if (activeSubPageFrame?.contentWindow?.handleTaobaoBack?.()) return 'handled'; } catch(e) {}
     }
     if (path === '/album') {
       try { if (activeSubPageFrame?.contentWindow?.handleAlbumBack?.()) return 'handled'; } catch(e) {}
+    }
+    if (path === '/lounge-board') {
+      try { if (activeSubPageFrame?.contentWindow?.handleLoungeBoardBack?.()) return 'handled'; } catch(e) {}
     }
     navigateToHome();
     return 'handled';
@@ -5706,7 +5679,11 @@ window.addEventListener('popstate', function(e) {
     const path = (() => {
       try { return new URL(currentSubPage || '', location.origin).pathname; } catch(e) { return currentSubPage || ''; }
     })();
-    if (path !== '/') navigateToHome();
+    if (path === '/lounge-board') {
+      try { if (activeSubPageFrame?.contentWindow?.handleLoungeBoardBack?.()) return; } catch(e) {}
+    }
+    if (/^\/(?:toys(?:\/|$)|whisper$)/.test(path)) returnFromToyControls();
+    else if (path !== '/') navigateToHome();
     else closeSubPage();
   }
 });
@@ -5772,4 +5749,12 @@ function closeWalletPanel() {
 }
 
 // All page/frame state above must exist before opening the initial desktop.
+window.AionPat?.bind({
+  container: $('messages'),
+  getContext: () => ({
+    scope: 'private', source_id: currentConvId,
+    names: { user: worldBook.user_name || '你', aion: worldBook.ai_name || 'AI' },
+  }),
+  onSent: message => handleSync({ type: 'msg_created', data: message }),
+});
 startChatApp();
